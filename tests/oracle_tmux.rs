@@ -220,11 +220,17 @@ fn oracle_tmux() {
                 let y = it.next().unwrap_or("0").to_string();
                 format!("{} {}", x.min(cols), y)
             };
+            // tmux 3.4+ emits `\t` for GRID_FLAG_TAB cells (whose width depends on
+            // active tab stops at write time) instead of spaces; cursor (x, y) still
+            // checks exact tab-stop column math.
+            let line_eq = |t: &str, a: &str| {
+                if t.contains('\t') { t.replace([' ', '\t'], "") == a.replace(' ', "") } else { t == a }
+            };
             let mut problems = Vec::new();
-            if t_lines != a_lines {
+            if t_lines.len() != a_lines.len() || t_lines.iter().zip(&a_lines).any(|(t, a)| !line_eq(t, a)) {
                 let mut d = String::new();
                 for (i, (t, a)) in t_lines.iter().zip(a_lines.iter()).enumerate() {
-                    if t != a {
+                    if !line_eq(t, a) {
                         d.push_str(&format!("\n   row {:2} tmux |{}|\n          amux |{}|", i, t, a));
                     }
                 }
@@ -233,10 +239,14 @@ fn oracle_tmux() {
             if t_cursor != a_cursor {
                 problems.push(format!("cursor tmux {} amux {}", t_cursor, a_cursor));
             }
-            let squash = |v: &Vec<String>| -> Vec<String> { v.iter().map(|l| l.replace(' ', "")).collect() };
+            let squash = |v: &[String]| -> Vec<String> { v.iter().map(|l| l.replace([' ', '\t'], "")).collect() };
             // After a reflow tmux drops wide-char padding spaces from history joins;
             // amux keeps history width-independent, so compare without spaces.
-            let hist_differs = if resize { squash(&t_hist) != squash(&a_hist) } else { t_hist != a_hist };
+            let hist_differs = if resize {
+                squash(&t_hist) != squash(&a_hist)
+            } else {
+                t_hist.len() != a_hist.len() || t_hist.iter().zip(&a_hist).any(|(t, a)| !line_eq(t, a))
+            };
             if hist_differs {
                 problems.push(format!("history differs: tmux {} lines, amux {} lines", t_hist.len(), a_hist.len()));
             }
