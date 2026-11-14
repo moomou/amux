@@ -126,7 +126,13 @@ fn generate(seed: u64, cols: usize, rows: usize) -> Vec<u8> {
                 let d = ['G', 'd'][r.below(2) as usize];
                 csi(format!("{}{}", n, d), &mut out)
             }
-            84 => csi(format!("{}b", 1 + r.below(5)), &mut out),
+            84 => {
+                let n = 1 + r.below(5);
+                // tmux < 3.4 ignores REP (`CSI b`) after multibyte UTF-8 while 3.4+ repeats it.
+                if out.last().is_none_or(|b| b.is_ascii()) {
+                    csi(format!("{}b", n), &mut out);
+                }
+            }
             85 => match r.below(4) {
                 0 => out.extend_from_slice(b"\x1bH"),
                 1 => csi("0g".into(), &mut out),
