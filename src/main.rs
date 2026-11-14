@@ -41,6 +41,6 @@ fn main() {
         Some("__bench-emu") => bench_emu(&args),
         Some("__keeper") => std::process::exit(amux::keeper::main(args.get(2).map(|s| s.as_str()).unwrap_or("{}"))),
         Some("__tmux-bridge") => std::process::exit(amux::bridge::main(&args[2..])),
-        _ => {}
+        _ => std::process::exit(amux::cli::main(args)),
     }
 }
