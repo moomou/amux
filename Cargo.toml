@@ -2,6 +2,12 @@
 name = "amux"
 version = "0.1.0"
 edition = "2024"
+description = "Crash-proof, agent-aware terminal multiplexer with hot-reloadable plugins and tmux compatibility"
+repository = "https://github.com/moomou/amux"
+readme = "README.md"
+license = "MIT"
+keywords = ["terminal", "multiplexer", "tmux", "agents", "tui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 libc = "0.2.191"

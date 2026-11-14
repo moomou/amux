@@ -8,9 +8,10 @@ working).
 > Status: experimental. Linux only. Verified against tmux 3.2a.
 
 ```sh
-cargo build --release
-./target/release/amux            # new session (reads ~/.tmux.conf)
-./target/release/amux attach     # reattach; after a crash or reboot too
+cargo install --git https://github.com/moomou/amux
+
+amux            # new session (reads ~/.tmux.conf)
+amux attach     # reattach; after a crash or reboot too
 ```
 
 Inside amux: `prefix A` opens the **agent dashboard**, `prefix N` jumps to the
