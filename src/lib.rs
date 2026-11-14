@@ -1,6 +1,7 @@
 //! amux: a crash-proof, agent-aware terminal multiplexer (tmux compatible).
 
 pub mod agents;
+pub mod bridge;
 pub mod cell;
 pub mod cmd;
 pub mod copymode;
@@ -14,4 +15,5 @@ pub mod paths;
 pub mod proto;
 pub mod pty;
 pub mod term;
+pub mod tmux;
 pub mod util;

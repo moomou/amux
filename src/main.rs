@@ -40,6 +40,7 @@ fn main() {
         Some("debug-emu") => debug_emu(&args),
         Some("__bench-emu") => bench_emu(&args),
         Some("__keeper") => std::process::exit(amux::keeper::main(args.get(2).map(|s| s.as_str()).unwrap_or("{}"))),
+        Some("__tmux-bridge") => std::process::exit(amux::bridge::main(&args[2..])),
         _ => {}
     }
 }
