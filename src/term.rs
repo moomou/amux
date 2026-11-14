@@ -435,9 +435,7 @@ impl Term {
     }
     pub fn mark_all(&mut self) {
         self.all_dirty = true;
-        for w in &mut self.dirty {
-            *w = !0;
-        }
+        self.dirty.fill(!0);
     }
     pub fn is_dirty(&self) -> bool {
         self.all_dirty || self.dirty.iter().any(|&w| w != 0)
@@ -872,9 +870,9 @@ impl Term {
         }
         let blank = self.erase_cell();
         let cols = self.cols;
-        for yy in py..py + ny {
+        for (yy, row) in self.grid.iter_mut().enumerate().take(py + ny).skip(py) {
             if yy < dy || yy >= dy + ny {
-                self.grid[yy].reset(cols, blank);
+                row.reset(cols, blank);
             }
         }
         if py < dy || py >= dy + ny {
@@ -931,8 +929,8 @@ impl Term {
         }
         let cols = self.cols;
         self.grid[top..=bot].rotate_left(n);
-        for y in (bot + 1 - n)..=bot {
-            self.grid[y].reset(cols, blank);
+        for row in &mut self.grid[(bot + 1 - n)..=bot] {
+            row.reset(cols, blank);
         }
         self.mark_range(top, bot);
     }
@@ -1851,11 +1849,9 @@ impl vte::Perform for Term {
                     self.erase_cells(y, 0, end);
                 }
                 2 => self.clear_screen(),
-                3 => {
-                    if arg0(params, 1).unwrap_or(0) == 0 {
-                        self.hist.clear();
-                        self.hscrolled = 0;
-                    }
+                3 if arg0(params, 1).unwrap_or(0) == 0 => {
+                    self.hist.clear();
+                    self.hscrolled = 0;
                 }
                 _ => {}
             },
@@ -2052,9 +2048,7 @@ impl vte::Perform for Term {
             (Some(b'#'), b'8') => {
                 let cols = self.cols;
                 for y in 0..self.rows {
-                    for x in 0..cols {
-                        self.grid[y].cells[x] = Cell { ch: 'E' as u32, fg: 0, bg: 0 };
-                    }
+                    self.grid[y].cells[..cols].fill(Cell { ch: 'E' as u32, fg: 0, bg: 0 });
                     self.grid[y].touch(cols);
                     self.mark_dirty(y);
                 }
@@ -2144,11 +2138,9 @@ impl vte::Perform for Term {
                     self.events.push(Event::Prompt(k, code));
                 }
             }
-            b"777" => {
-                if params.get(1) == Some(&&b"notify"[..]) {
-                    let t = params.get(2).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
-                    self.events.push(Event::Notify(t, join(3)));
-                }
+            b"777" if params.get(1) == Some(&&b"notify"[..]) => {
+                let t = params.get(2).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
+                self.events.push(Event::Notify(t, join(3)));
             }
             _ => {}
         }

@@ -424,11 +424,7 @@ fn client_loop(conn: &mut Conn, sigs: &util::Signals, raw: &mut Option<util::Raw
                             conn.send(c2s::RESIZE, &Enc::new().u16(c).u16(rr).buf);
                         }
                     }
-                    libc::SIGINT => {
-                        if raw.is_none() {
-                            return Done::Exit(130, String::new());
-                        }
-                    }
+                    libc::SIGINT if raw.is_none() => return Done::Exit(130, String::new()),
                     _ => {}
                 }
             }
