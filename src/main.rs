@@ -39,6 +39,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("debug-emu") => debug_emu(&args),
         Some("__bench-emu") => bench_emu(&args),
+        Some("__keeper") => std::process::exit(amux::keeper::main(args.get(2).map(|s| s.as_str()).unwrap_or("{}"))),
         _ => {}
     }
 }

@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod copymode;
 pub mod format;
 pub mod history;
+pub mod keeper;
 pub mod keys;
 pub mod model;
 pub mod options;
