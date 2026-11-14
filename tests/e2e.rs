@@ -817,15 +817,42 @@ fn tmux_fixture(e: &Env) -> TmuxSrv {
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
     let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
-    t.ok(&["-f", "/dev/null", "new-session", "-d", "-s", "work", "-x", "100", "-y", "30", "-n", "edit", "-c", a, "sh"]);
-    t.ok(&["split-window", "-h", "-t", "work:edit", "-c", b, "sh"]);
-    t.ok(&["new-window", "-t", "work", "-n", "live", "-c", b, "cat"]);
-    t.ok(&["new-window", "-t", "work", "-n", "paste", "-c", a, "sh -c \"printf '\\033[?2004h\\033[?25l'; exec cat -v\""]);
+    t.ok(&[
+        "-f",
+        "/dev/null",
+        "start-server",
+        ";",
+        "set-option",
+        "-g",
+        "default-shell",
+        "/bin/sh",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "-x",
+        "100",
+        "-y",
+        "30",
+        "-n",
+        "edit",
+        "-c",
+        a,
+    ]);
+    t.ok(&["split-window", "-h", "-t", "work:edit", "-c", b]);
+    t.ok(&["new-window", "-t", "work", "-n", "live", "-c", b, "exec cat"]);
+    t.ok(&["new-window", "-t", "work", "-n", "paste", "-c", a, "printf '\\033[?2004h\\033[?25l'; exec cat -v"]);
     // Attaching normally copies update-environment variables into the
     // session: a bridge must leave this one alone.
     t.ok(&["set-environment", "-t", "work", "SSH_AUTH_SOCK", "/fixture/agent.sock"]);
     t.ok(&["send-keys", "-t", "work:edit.0", "echo history-line-1; echo history-line-2", "Enter"]);
-    assert!(e.until(5.0, || t.ok(&["capture-pane", "-p", "-t", "work:edit.0"]).contains("history-line-2\n")));
+    // Leading newline matches echo's output, not the echoed command line; also
+    // wait until every pane has finished spawning (e.g. systemd cgroup setup).
+    assert!(e.until(5.0, || {
+        t.ok(&["capture-pane", "-p", "-t", "work:edit.0"]).contains("\nhistory-line-2\n")
+            && t.ok(&["list-panes", "-s", "-t", "work", "-F", "#{pane_current_command}"]).lines().collect::<Vec<_>>() == ["sh", "sh", "cat", "cat"]
+    }));
     // The current window has no live pane: any bridge that selected its own
     // pane's window in tmux would show up as a change.
     t.ok(&["select-window", "-t", "work:edit"]);
@@ -916,10 +943,11 @@ fn bridge_failures_and_endings_never_hurt_tmux() {
     }
     let e = Env::new("bridge", None);
     let t = tmux_fixture(&e);
-    t.ok(&["new-window", "-t", "work", "-n", "flood", "sh -c 'while read n; do seq 1 $n; echo SEQ-DONE-$n; done'"]);
+    t.ok(&["new-window", "-t", "work", "-n", "flood", "while read n; do seq 1 $n; echo SEQ-DONE-$n; done"]);
     let flood = t.ok(&["display", "-p", "-t", "work:flood", "#{pane_id}"]).trim().to_string();
-    e.ok(&["migrate", "-S", t.path(), "--apply"]);
-    assert!(e.until(5.0, || t.clients() == 3), "expected 3 bridges, tmux has {} clients", t.clients());
+    assert!(e.until(5.0, || t.ok(&["display", "-p", "-t", &flood, "#{pane_current_command}"]).trim() == "sh"));
+    let out = e.ok(&["migrate", "-S", t.path(), "--apply"]);
+    assert!(e.until(5.0, || t.clients() == 3), "expected 3 bridges ({out}), tmux clients:\n{}", t.ok(&["list-clients"]));
     // A bridge that dies takes only its own tmux client with it; the program
     // keeps running in tmux and still answers.
     let bridge = e.pids(&format!("__tmux-bridge -S {} -t %2 ", t.path()));
