@@ -865,7 +865,7 @@ impl Server {
             return;
         }
         self.plugins_drain_inotify();
-        if self.plugins.rescan_at.is_some() {
+        if self.plugins.inotify.is_none() || self.plugins.rescan_at.is_some() {
             self.plugins_rescan();
         }
     }
@@ -2182,6 +2182,7 @@ impl Server {
             }
             "new" | "create" => self.plugin_new(cid, &args),
             "reload" | "restart" => {
+                self.plugins_rescan();
                 let ids: Vec<u32> = if args.is_empty() {
                     self.plugins.plugins.iter().filter(|p| p.state != PState::Disabled).map(|p| p.id).collect()
                 } else {
@@ -2196,8 +2197,14 @@ impl Server {
                     self.output(cid, "plugins", vec![format!("no plugins in {}", self.plugins.dir.display())]);
                     return Ok(Flow::Next);
                 }
-                for id in &ids {
-                    self.plugin_reload(*id);
+                for &id in &ids {
+                    let already_loading = self
+                        .plugins
+                        .idx(id)
+                        .is_some_and(|i| matches!(self.plugins.plugins[i].state, PState::Starting | PState::Stopping { then: After::Restart, .. }));
+                    if !already_loading {
+                        self.plugin_reload(id);
+                    }
                 }
                 self.plugin_wait_load(cid, ids)
             }

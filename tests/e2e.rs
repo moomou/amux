@@ -209,7 +209,12 @@ fn reboot_restores_layout_and_scrollback() {
     assert!(e.until(6.0, || e.display("r:1", "#{agent}") == "claude"), "agent not detected");
     e.ok(&["snapshot-panes"]);
     let snaps = e.dir.join("state").join(&e.name).join("panes");
-    assert!(e.until(5.0, || std::fs::read_dir(&snaps).map(|d| d.count() >= 3).unwrap_or(false)), "no snapshots");
+    assert!(
+        e.until(5.0, || {
+            std::fs::read_dir(&snaps).map(|d| d.flatten().filter(|f| f.path().extension().is_some_and(|x| x == "snap")).count() >= 3).unwrap_or(false)
+        }),
+        "no snapshots"
+    );
     // Simulate a reboot: every process dies and the runtime dir (tmpfs) is gone.
     let run = e.dir.join("run").to_string_lossy().into_owned();
     let mut victims = e.pids(&format!("__supervisor {}", e.name));

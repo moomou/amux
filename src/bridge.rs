@@ -340,7 +340,11 @@ fn control(sh: &Shared, rx: &mpsc::Receiver<Ev>, _socket: &str, pane: &str, sid:
                     *c = path.clone();
                 }
                 for (id, _, _) in &list {
-                    if id != pane && off.insert(id.clone()) && !sh.send(&format!("refresh-client -A '{}:off'", id), Pending::Ignore) {
+                    // `:pause` (not `:off`): in tmux 3.4+, `:off` on all control
+                    // clients disables reading the pane when no terminal client
+                    // is attached, whereas `:pause` drops output for this client
+                    // only while keeping the pane's PTY reader active.
+                    if id != pane && off.insert(id.clone()) && !sh.send(&format!("refresh-client -A '{}:pause'", id), Pending::Ignore) {
                         return "tmux closed the connection".into();
                     }
                 }
