@@ -559,7 +559,11 @@ impl Tracker {
 
     /// The user typed into the pane: an open question is now answered.
     pub fn note_input(&mut self, now: Instant, lines: &[String]) {
-        if self.state == State::Waiting && self.explicit.is_none() {
+        if matches!(self.explicit, Some((State::Waiting, _, _))) {
+            self.explicit = None;
+            self.state = State::Working;
+            self.since = now;
+        } else if self.state == State::Waiting && self.explicit.is_none() {
             if let Some(c) = self.agent.clone() {
                 self.answered = lines
                     .iter()
@@ -572,9 +576,6 @@ impl Tracker {
             }
             self.state = State::Working;
             self.since = now;
-        }
-        if let Some((State::Waiting, _, _)) = &self.explicit {
-            self.explicit = None;
         }
     }
 

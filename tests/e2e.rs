@@ -325,11 +325,10 @@ fn agents_are_detected_and_tracked() {
     // Any pane can report status explicitly (agent hooks). A mark set from
     // outside the pane survives its process reports (the first one, a new
     // working directory, other programs) until it is cleared.
-    let pid = e.ok(&["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "a"]).trim().to_string();
+    let pid = e.ok(&["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "a", "sh -c 'sleep 0.3; cd /tmp; sleep 0.3; exec sh'"]).trim().to_string();
     e.ok(&["status", "set", "waiting", "needs review of PR 12", "-t", &pid]);
-    e.ok(&["send-keys", "-t", &pid, "cd /tmp; sleep 0.3", "Enter"]);
     assert!(e.until(5.0, || e.display(&pid, "#{pane_current_path}") == "/tmp"), "no process report");
-    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(1100));
     let out = e.ok(&["agents"]);
     assert!(out.contains("needs review of PR 12"), "{out}");
     e.ok(&["status", "clear", "-t", &pid]);
