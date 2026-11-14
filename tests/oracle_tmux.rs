@@ -153,6 +153,9 @@ fn oracle_tmux() {
         eprintln!("tmux not found; skipping");
         return;
     }
+    let ver = Command::new("tmux").arg("-V").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let nums: Vec<u32> = ver.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(2).filter_map(|s| s.parse().ok()).collect();
+    let tmux_34_plus = nums.len() >= 2 && (nums[0], nums[1]) >= (3, 4);
     let cases: u64 = std::env::var("AMUX_ORACLE_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
     let start: u64 = std::env::var("AMUX_ORACLE_START").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let dir = std::env::temp_dir().join(format!("amux-oracle-{}", std::process::id()));
@@ -240,9 +243,10 @@ fn oracle_tmux() {
                 problems.push(format!("cursor tmux {} amux {}", t_cursor, a_cursor));
             }
             let squash = |v: &[String]| -> Vec<String> { v.iter().map(|l| l.replace([' ', '\t'], "")).collect() };
-            // After a reflow tmux drops wide-char padding spaces from history joins;
-            // amux keeps history width-independent, so compare without spaces.
-            let hist_differs = if resize {
+            // After a reflow (or in tmux 3.4+, where `-J` omits GRID_STRING_EMPTY_CELLS),
+            // tmux drops unwritten padding spaces from history joins; compare line
+            // counts and non-space content there, and exact spaces on tmux < 3.4.
+            let hist_differs = if resize || tmux_34_plus {
                 squash(&t_hist) != squash(&a_hist)
             } else {
                 t_hist.len() != a_hist.len() || t_hist.iter().zip(&a_hist).any(|(t, a)| !line_eq(t, a))
