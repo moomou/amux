@@ -192,7 +192,7 @@ fn is_tty() -> bool {
 
 fn hello(conn: &mut Conn) {
     let (cols, rows) = if is_tty() { term_size() } else { (0, 0) };
-    let term = if is_tty() { std::env::var("TERM").unwrap_or_else(|_| "xterm".into()) } else { String::new() };
+    let term = if is_tty() { std::env::var("TERM").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "xterm".into()) } else { String::new() };
     let mut e = Enc::new();
     e.u32(proto::VERSION).u32(0).u16(cols).u16(rows).str(&term).str(&std::env::var("COLORTERM").unwrap_or_default());
     e.str(&std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
@@ -208,6 +208,7 @@ fn hello(conn: &mut Conn) {
         "XAUTHORITY",
         "COLORTERM",
         "TERM_PROGRAM",
+        "AMUX",
         "AMUX_PANE",
         // To refuse attaching from a tmux pane that amux shows live.
         "TMUX",
@@ -565,6 +566,17 @@ fn supervisor(name: &str, config: Option<String>) -> i32 {
             Some(0 | 75) => {
                 logf!("server exited cleanly ({:?})", code);
                 return 0;
+            }
+            Some(76) => {
+                let exe = crate::server::exe_path();
+                logf!("re-execing supervisor from {}", exe);
+                use std::os::unix::process::CommandExt;
+                let mut c = std::process::Command::new(&exe);
+                c.arg0("amux").arg("__supervisor").arg(name);
+                if let Some(cfg) = &config {
+                    c.arg(cfg);
+                }
+                let _ = c.exec();
             }
             _ => {
                 restarts += 1;

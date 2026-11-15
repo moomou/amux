@@ -152,6 +152,7 @@ fn build(srv: &Server, c: &Client, spare: Vec<Cell>) -> Canvas {
     let mut cv = Canvas::with_buffer(spare, w, h);
     let Some(sid) = c.attached else { return cv };
     let Some(sess) = srv.sessions.iter().find(|s| s.id == sid) else { return cv };
+    cv.mouse = srv.opt(Some(sid), None, "mouse") == "on";
     let status_on = srv.opt(Some(sid), None, "status") != "off";
     let top = srv.opt(Some(sid), None, "status-position") == "top";
     let (wy0, wh) = if status_on { (if top { 1 } else { 0 }, h.saturating_sub(1)) } else { (0, h) };
@@ -183,7 +184,7 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
     let ah = (area.h as usize).min(win.sy as usize);
     let mut covered = vec![false; aw * ah];
     let mouse_wanted = srv.panes.get(&win.active).map(|p| p.mirror.modes.mouse != 0).unwrap_or(false);
-    cv.mouse = srv.gflag("mouse") || mouse_wanted;
+    cv.mouse |= mouse_wanted;
     for (pid, r) in &rects {
         let Some(p) = srv.panes.get(pid) else { continue };
         let m = &p.mirror;

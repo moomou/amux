@@ -342,11 +342,22 @@ pub struct Server {
 }
 
 pub fn exe_path() -> String {
-    if std::path::Path::new("/proc/self/exe").exists() {
-        "/proc/self/exe".into()
-    } else {
-        std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "amux".into())
+    if let Ok(p) = std::env::current_exe() {
+        let s = p.to_string_lossy();
+        let clean = s.strip_suffix(" (deleted)").unwrap_or(&s);
+        if std::path::Path::new(clean).is_file() {
+            return clean.to_string();
+        }
     }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("amux");
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if std::path::Path::new("/proc/self/exe").exists() { "/proc/self/exe".into() } else { "amux".into() }
 }
 
 fn take_lock(path: &std::path::Path) -> io::Result<OwnedFd> {
@@ -408,7 +419,12 @@ pub fn main(name: &str, config: Option<String>) -> i32 {
         }
     };
     let restarts: u32 = std::env::var("AMUX_RESTARTS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| !k.starts_with("AMUX_") && k != "TMUX" && k != "TMUX_PANE").collect();
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            matches!(k.as_str(), "AMUX_RUNTIME_DIR" | "AMUX_STATE_DIR" | "AMUX_PLUGIN_DIR")
+                || (!k.starts_with("AMUX_") && k != "AMUX" && k != "TMUX" && k != "TMUX_PANE")
+        })
+        .collect();
     env.sort();
     let plugin_host = plugins::Host::new(&paths);
     let mut srv = Server {
@@ -452,13 +468,23 @@ pub fn main(name: &str, config: Option<String>) -> i32 {
         agent_kinds: agents::Kinds::new(),
     };
     srv.install_shim();
-    srv.load_config(config);
+    srv.load_config(config.clone());
     srv.recover();
     srv.plugins.booted = true;
     srv.plugins_init();
     logf!("server ready (restarts={}, sessions={}, panes={})", restarts, srv.sessions.len(), srv.panes.len());
+    let unsupervised = srv.heartbeat.is_none();
     let code = srv.run(&sigs);
     let _ = std::fs::remove_file(srv.paths.server_sock());
+    drop(_lock);
+    if unsupervised && code == 76 {
+        let mut argv = vec![exe_path(), "__supervisor".into(), name.to_string()];
+        if let Some(cfg) = config {
+            argv.push(cfg);
+        }
+        let _ = pty::spawn_daemon(&argv, None, Some(&srv.paths.log_file()));
+        return 0;
+    }
     code
 }
 
@@ -488,7 +514,7 @@ impl Server {
         // `amux` there too, for plugins (amux may not be on PATH).
         let dir = self.paths.shim_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let target = std::env::current_exe().unwrap_or_else(|_| "amux".into());
+        let target = exe_path();
         for name in ["tmux", "amux"] {
             let link = dir.join(name);
             let _ = std::fs::remove_file(&link);
@@ -927,19 +953,12 @@ impl Server {
             self.destroy_window(w);
         }
         // Move or detach clients attached to it.
-        let other = self.sessions.iter().max_by_key(|s| s.activity).map(|s| s.id);
-        for i in 0..self.clients.len() {
-            if self.clients[i].attached == Some(sid) {
-                match other {
-                    Some(o) => {
-                        self.clients[i].attached = Some(o);
-                        self.clients[i].full_redraw = true;
-                    }
-                    None => {
-                        let cid = self.clients[i].id;
-                        self.detach_client(cid, "[exited]");
-                    }
-                }
+        let other = self.sessions.iter().max_by_key(|s| (s.activity, s.id)).map(|s| s.id);
+        let attached: Vec<u32> = self.clients.iter().filter(|c| c.attached == Some(sid)).map(|c| c.id).collect();
+        for cid in attached {
+            match other {
+                Some(o) => self.attach(cid, o),
+                None => self.detach_client(cid, "[exited]"),
             }
         }
         if self.sessions.is_empty() && self.gflag("exit-empty") {
@@ -1414,6 +1433,10 @@ impl Server {
                     let v = d.string()?;
                     env.push((k, v));
                 }
+                let same_server =
+                    env.iter().find(|(k, _)| k == "AMUX").and_then(|(_, v)| v.split(',').next()).is_none_or(|s| {
+                        std::path::Path::new(s) == self.paths.server_sock() || util::same_file(std::path::Path::new(s), &self.paths.server_sock())
+                    });
                 let Some(i) = self.client_idx(cid) else { return Ok(()) };
                 let c = &mut self.clients[i];
                 c.cols = cols.max(2);
@@ -1422,7 +1445,8 @@ impl Server {
                 c.truecolor = colorterm == "truecolor" || colorterm == "24bit";
                 c.cwd = cwd;
                 c.pid = pid;
-                c.caller_pane = env.iter().find(|(k, _)| k == "AMUX_PANE").and_then(|(_, v)| v.trim_start_matches('%').parse().ok());
+                c.caller_pane =
+                    if same_server { env.iter().find(|(k, _)| k == "AMUX_PANE").and_then(|(_, v)| v.trim_start_matches('%').parse().ok()) } else { None };
                 c.env = env;
             }
             c2s::CMD => {

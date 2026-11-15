@@ -604,11 +604,17 @@ impl Server {
             let (x, y) = ds.split_once('x').unwrap_or(("80", "24"));
             (x.parse().unwrap_or(80), y.parse().unwrap_or(24))
         };
-        let c = self.client_idx(cid).map(|i| &self.clients[i]);
+        let scid = self
+            .caller_pane_here(cid)
+            .and_then(|p| self.window_of_pane(p))
+            .and_then(|w| self.session_of_window(w))
+            .and_then(|s| self.target_attached_client(cid, Some(s)))
+            .unwrap_or(cid);
+        let c = self.client_idx(scid).map(|i| &self.clients[i]);
         // Like tmux: an attached client's terminal (minus the status line)
         // decides the size; otherwise -x/-y or default-size, used as is.
         match c {
-            Some(c) if !detached && c.cols > 0 => {
+            Some(c) if !detached && (!c.term.is_empty() || c.attached.is_some()) && c.cols > 0 => {
                 let status = if self.gopt("status") == "off" { 0 } else { 1 };
                 (c.cols.max(2), c.rows.saturating_sub(status).max(1))
             }
@@ -731,6 +737,72 @@ impl Server {
         }
     }
 
+    /// Pane of this server from which unattached CLI client `cid` was invoked.
+    fn caller_pane_here(&self, cid: u32) -> Option<u32> {
+        let c = &self.clients[self.client_idx(cid)?];
+        if c.attached.is_some() {
+            return None;
+        }
+        let pid = c.caller_pane?;
+        let pane = self.panes.get(&pid)?;
+        let has_amux = c.env.iter().any(|(k, _)| k == "AMUX");
+        if has_amux || (pane.child_pid != 0 && util::proc_stat(c.pid).is_some_and(|st| st.session == pane.child_pid)) { Some(pid) } else { None }
+    }
+
+    fn detach_other_clients(&mut self, sid: u32, keep: u32) {
+        let others: Vec<u32> = self.clients.iter().filter(|c| c.attached == Some(sid) && c.id != keep).map(|c| c.id).collect();
+        for o in others {
+            self.detach_client(o, "[detached (from session)]");
+        }
+    }
+
+    /// Resolve a session target (`name`, `$id`, `=name`, or `session:window.pane`/`@w`/`%p`),
+    /// selecting the addressed window and pane when one is part of `t`.
+    fn resolve_session_target(&mut self, cid: u32, t: Option<&str>) -> Result<u32, String> {
+        let t = t.unwrap_or("");
+        if t.is_empty() {
+            return self.find_session(cid, "");
+        }
+        if let Some(s) = self.sessions.iter().find(|s| s.name == t) {
+            return Ok(s.id);
+        }
+        if t.contains(':') || t.contains('.') || t.starts_with('%') || t.starts_with('@') {
+            let (s, w, p) = self.target_pane(cid, Some(t))?;
+            self.select_window(s, w);
+            self.select_pane(p);
+            Ok(s)
+        } else {
+            self.find_session(cid, t)
+        }
+    }
+
+    /// Attach `cid` to `sid`, or switch the outer client when `cid` runs inside a pane here.
+    fn attach_or_switch(&mut self, cid: u32, sid: u32, detach_others: bool) -> Result<(), String> {
+        if let Some(pane) = self.caller_pane_here(cid) {
+            let caller_sid = self.window_of_pane(pane).and_then(|w| self.session_of_window(w));
+            let tcid =
+                self.target_attached_client(cid, caller_sid).ok_or_else(|| "sessions should be nested with care, unset $AMUX_PANE to force".to_string())?;
+            if detach_others {
+                self.detach_other_clients(sid, tcid);
+            }
+            self.attach(tcid, sid);
+            return Ok(());
+        }
+        if self.client_idx(cid).is_some_and(|i| self.clients[i].attached.is_none()) {
+            if let Some(why) = self.loops_through_tmux(cid) {
+                return Err(why);
+            }
+            if self.client_idx(cid).is_none_or(|i| self.clients[i].term.is_empty()) {
+                return Err("not a terminal".into());
+            }
+        }
+        if detach_others {
+            self.detach_other_clients(sid, cid);
+        }
+        self.attach(cid, sid);
+        Ok(())
+    }
+
     pub fn attach(&mut self, cid: u32, sid: u32) {
         let mouse = self.opt(Some(sid), None, "mouse") == "on";
         let focus = self.gflag("focus-events");
@@ -742,12 +814,16 @@ impl Server {
             c.last_session = was;
         }
         c.attached = Some(sid);
+        c.overlay = None;
+        c.repeat_until = None;
         c.full_redraw = true;
         c.dirty = true;
         c.activity = Instant::now();
         c.key_table = "root".into();
-        if was.is_none() {
+        if was != Some(sid) {
             c.out(s2c::ATTACHED, &Enc::new().u32(sid).buf);
+        }
+        if was.is_none() {
             c.out(s2c::OUTPUT, &render::terminal_setup(mouse, focus));
             c.outer_mouse = mouse;
             c.outer_focus = focus;
@@ -761,6 +837,8 @@ impl Server {
         }
         if was.is_none() {
             self.client_event("client-attached", cid, Some(sid));
+        } else if was != Some(sid) {
+            self.client_event("client-session-changed", cid, Some(sid));
         }
         if let Some(p) = self.active_pane(sid)
             && let Some(pp) = self.panes.get_mut(&p)
@@ -780,20 +858,26 @@ impl Server {
         match cmd {
             "new-session" => {
                 let a = args!("AdDEPXc:e:F:n:s:t:x:y:");
-                if a.has('A')
-                    && let Some(n) = a.get('s')
-                    && let Ok(sid) = self.find_session(cid, &format!("={}", n))
-                {
-                    if !a.has('d') {
-                        if let Some(why) = self.loops_through_tmux(cid) {
-                            return Err(why);
+                if a.has('A') {
+                    let existing = match a.get('s') {
+                        Some(n) => self.find_session(cid, &format!("={}", n)).ok(),
+                        None => self.current(cid).0,
+                    };
+                    if let Some(sid) = existing {
+                        if !a.has('d') {
+                            self.attach_or_switch(cid, sid, a.has('D'))?;
                         }
-                        self.attach(cid, sid);
+                        return Ok(Flow::Next);
                     }
-                    return Ok(Flow::Next);
                 }
-                let attach = !a.has('d') && self.client_idx(cid).map(|i| self.clients[i].cli && !self.clients[i].term.is_empty()).unwrap_or(false);
-                if attach && let Some(why) = self.loops_through_tmux(cid) {
+                let cli_tty = self.client_idx(cid).is_some_and(|i| self.clients[i].cli && !self.clients[i].term.is_empty());
+                let is_attached = self.client_idx(cid).is_some_and(|i| self.clients[i].attached.is_some());
+                let want_attach = !a.has('d') && (cli_tty || is_attached);
+                if want_attach
+                    && !is_attached
+                    && self.caller_pane_here(cid).is_none()
+                    && let Some(why) = self.loops_through_tmux(cid)
+                {
                     return Err(why);
                 }
                 let sid = self.create_session(cid, &a)?;
@@ -802,47 +886,27 @@ impl Server {
                     let out = format::expand(&f, &Fv { srv: self, client: None, sid: Some(sid), wid: None, pid: None, idx: None });
                     self.output(cid, "", vec![out]);
                 }
-                if attach {
-                    self.attach(cid, sid);
-                } else if let Some(i) = self.client_idx(cid)
-                    && self.clients[i].attached.is_some()
-                {
-                    self.attach(cid, sid);
+                if want_attach {
+                    self.attach_or_switch(cid, sid, false)?;
                 }
                 Ok(Flow::Next)
             }
             "attach-session" => {
-                let a = args!("dErxc:f:t:");
+                let a = Args::parse_anywhere(rest, "dErxc:f:t:").map_err(|e| format!("{}: {}", cmd, e))?;
                 if self.sessions.is_empty() {
                     return Err("no sessions".into());
                 }
-                let sid = self.find_session(cid, a.get('t').map(|t| t.split(':').next().unwrap_or(t)).unwrap_or(""))?;
-                if let Some(t) = a.get('t')
-                    && let Ok((_, w)) = self.target_window(cid, Some(t))
-                    && t.contains(':')
-                {
-                    self.select_window(sid, w);
+                if (a.get('t').is_some() && !a.pos.is_empty()) || a.pos.len() > 1 {
+                    return Err("attach-session: too many arguments".into());
                 }
-                if let Some(why) = self.loops_through_tmux(cid) {
-                    return Err(why);
-                }
-                if let Some(i) = self.client_idx(cid)
-                    && self.clients[i].term.is_empty()
-                {
-                    return Err("not a terminal".into());
-                }
-                if a.has('d') {
-                    let others: Vec<u32> = self.clients.iter().filter(|c| c.attached == Some(sid) && c.id != cid).map(|c| c.id).collect();
-                    for o in others {
-                        self.detach_client(o, "[detached (from session)]");
-                    }
-                }
+                let t = a.get('t').or_else(|| a.pos.first().map(|s| s.as_str()));
+                let sid = self.resolve_session_target(cid, t)?;
                 if let Some(c) = a.get('c')
                     && let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid)
                 {
                     s.cwd = util::expand_home(c);
                 }
-                self.attach(cid, sid);
+                self.attach_or_switch(cid, sid, a.has('d'))?;
                 Ok(Flow::Next)
             }
             "detach-client" => {
@@ -942,6 +1006,9 @@ impl Server {
                 let a = args!("t:");
                 let sid = self.find_session(cid, a.get('t').unwrap_or(""))?;
                 let name = a.pos.first().ok_or("rename-session: missing name")?.clone();
+                if name.contains(':') || name.contains('.') {
+                    return Err(format!("invalid session name: {}", name));
+                }
                 if self.sessions.iter().any(|s| s.name == name && s.id != sid) {
                     return Err(format!("duplicate session: {}", name));
                 }
@@ -952,37 +1019,49 @@ impl Server {
                 Ok(Flow::Next)
             }
             "switch-client" => {
-                let a = args!("ElnprZc:t:T:");
+                let a = Args::parse_anywhere(rest, "ElnprZc:t:T:").map_err(|e| format!("{}: {}", cmd, e))?;
+                let tcid = match a.get('c') {
+                    Some(name) => {
+                        let want = name.strip_prefix("/dev/").unwrap_or(name);
+                        let want_id = want.strip_prefix("client").unwrap_or(want).parse::<u32>().ok();
+                        self.clients
+                            .iter()
+                            .find(|c| c.attached.is_some() && !c.closing && Some(c.id) == want_id)
+                            .map(|c| c.id)
+                            .ok_or_else(|| format!("can't find client: {}", name))?
+                    }
+                    None => {
+                        let prefer = self.caller_pane_here(cid).and_then(|p| self.window_of_pane(p)).and_then(|w| self.session_of_window(w));
+                        self.target_attached_client(cid, prefer).ok_or("no current client")?
+                    }
+                };
                 if let Some(t) = a.get('T') {
-                    if let Some(i) = self.client_idx(cid) {
+                    if let Some(i) = self.client_idx(tcid) {
                         self.clients[i].key_table = t.to_string();
+                        self.clients[i].dirty = true;
                     }
                     return Ok(Flow::Next);
                 }
-                let Some(i) = self.client_idx(cid) else { return Ok(Flow::Next) };
-                let cur = self.clients[i].attached;
+                if self.sessions.is_empty() {
+                    return Err("no sessions".into());
+                }
+                if (a.get('t').is_some() && !a.pos.is_empty()) || a.pos.len() > 1 {
+                    return Err("switch-client: too many arguments".into());
+                }
+                let Some(ti) = self.client_idx(tcid) else { return Ok(Flow::Next) };
+                let cur = self.clients[ti].attached;
                 let target = if a.has('l') {
-                    self.clients[i].last_session.filter(|s| self.sessions.iter().any(|x| x.id == *s)).ok_or("no last session")?
+                    self.clients[ti].last_session.filter(|s| self.sessions.iter().any(|x| x.id == *s)).ok_or("no last session")?
                 } else if a.has('n') || a.has('p') {
                     let n = self.sessions.len();
                     let pos = self.sessions.iter().position(|s| Some(s.id) == cur).unwrap_or(0);
                     let k = if a.has('n') { (pos + 1) % n } else { (pos + n - 1) % n };
                     self.sessions[k].id
-                } else if let Some(t) = a.get('t') {
-                    if t.contains(':') || t.contains('.') || t.starts_with('%') || t.starts_with('@') {
-                        let (s, w, p) = self.target_pane(cid, Some(t))?;
-                        self.select_window(s, w);
-                        self.select_pane(p);
-                        s
-                    } else {
-                        self.find_session(cid, t)?
-                    }
                 } else {
-                    return Ok(Flow::Next);
+                    let t = a.get('t').or_else(|| a.pos.first().map(|s| s.as_str())).ok_or("switch-client: missing target session")?;
+                    self.resolve_session_target(cid, Some(t))?
                 };
-                if let Some(c) = self.target_attached_client(cid, None) {
-                    self.attach(c, target);
-                }
+                self.attach(tcid, target);
                 Ok(Flow::Next)
             }
             "new-window" => {
@@ -2120,8 +2199,10 @@ impl Server {
                     return Ok(Flow::Next);
                 }
                 let a = args!("GNrswZF:f:K:O:t:");
+                let prefer = self.caller_pane_here(cid).and_then(|p| self.window_of_pane(p)).and_then(|w| self.session_of_window(w));
+                let tcid = self.target_attached_client(cid, prefer).ok_or("choose-tree needs an attached client")?;
                 let mut items = Vec::new();
-                let (cur_s, cur_w, _) = self.current(cid);
+                let (cur_s, cur_w, _) = self.current(tcid);
                 let mut sel = 0;
                 for s in &self.sessions {
                     if Some(s.id) == cur_s && !a.has('w') {
@@ -2149,7 +2230,7 @@ impl Server {
                         }
                     }
                 }
-                if let Some(i) = self.client_idx(cid) {
+                if let Some(i) = self.client_idx(tcid) {
                     self.clients[i].overlay = Some(Overlay::Tree { sel, items });
                     self.clients[i].dirty = true;
                 }
@@ -2410,6 +2491,11 @@ impl Server {
             "__migrate-import" => self.migrate_import(cid, rest),
             "await" => self.cmd_await(cid, rest),
             "panes" => self.dispatch(cid, "list-panes", &["-a".to_string()]),
+            "restart-server" => {
+                self.save_state();
+                self.quit = Some(76);
+                Ok(Flow::Next)
+            }
             "panic-test" => {
                 let a = args!("kt:");
                 if a.has('k') {

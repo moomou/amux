@@ -10,8 +10,8 @@ working).
 ```sh
 cargo install --git https://github.com/moomou/amux
 
-amux            # new session (reads ~/.tmux.conf)
-amux attach     # reattach; after a crash or reboot too
+amux                 # new session (reads ~/.tmux.conf)
+amux a [NAME]        # reattach (or switch if already inside amux)
 ```
 
 Inside amux: `prefix A` opens the **agent dashboard**, `prefix N` jumps to the
@@ -427,6 +427,7 @@ amux-only commands (tmux commands are not repeated here):
 | `agent-view [-t]`, `agent-next` | Dashboard / next agent needing attention (bound to `prefix A` / `prefix N`) |
 | `plugin view [NAME]` | Plugin view (bound to `prefix P`) |
 | `snapshot-panes` | Snapshot all pane scrollback now |
+| `restart-server` | Re-exec supervisor and server onto the installed `amux` binary while keeping all panes running |
 | `server-info` | Paths, counts, restart count and per-phase CPU timings |
 | `panic-test [-k -t PANE]` | Crash the server (or one pane's emulator) to see recovery |
 

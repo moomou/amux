@@ -1060,3 +1060,109 @@ fn migrate_keeps_panes_fresh_when_detaching_could_destroy_tmux_sessions() {
         "{err}"
     );
 }
+
+#[test]
+fn session_reattach_and_switching_work_across_cli_keys_and_tree() {
+    if !tmux_ok() {
+        eprintln!("tmux not found; skipping");
+        return;
+    }
+    let e = Env::new("sessions", None);
+    let sock = e.dir.join("reattach.sock").to_string_lossy().into_owned();
+    let shell_cmd = format!(
+        "env AMUX_RUNTIME_DIR={} AMUX_STATE_DIR={} AMUX_PLUGIN_DIR={} SHELL=/bin/sh PS1='OUTER$ ' /bin/sh -i",
+        e.dir.join("run").display(),
+        e.dir.join("state").display(),
+        e.dir.join("plugins").display(),
+    );
+    let ok = Command::new("tmux")
+        .args(["-S", &sock, "-f", "/dev/null", "new", "-d", "-s", "ui", "-x", "120", "-y", "40", &shell_cmd])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .status();
+    assert!(ok.is_ok_and(|s| s.success()), "cannot start outer tmux");
+    let ui = Outer { sock };
+    let amux = format!("{} -L {} -f {}", bin(), e.name, e.config);
+    let send_line = |line: &str| {
+        let _ = Command::new("tmux").args(["-S", &ui.sock, "send-keys", "-t", "ui", "-l", line]).env_remove("TMUX").status();
+        ui.keys(&["Enter"]);
+    };
+
+    // 1. Create `alpha` interactively, detach (`prefix d`), then add `beta` with two windows.
+    assert!(e.until(5.0, || ui.screen().contains("OUTER$")), "{}", ui.screen());
+    send_line(&format!("{amux} new -s alpha"));
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]")), "{}", ui.screen());
+    e.ok(&["send-keys", "-t", "alpha", "echo ALPHA-ONE", "Enter"]);
+    assert!(e.until(5.0, || ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+    ui.keys(&["C-b", "d"]);
+    assert!(e.until(5.0, || ui.screen().contains("[detached (from session alpha)]")), "{}", ui.screen());
+
+    e.ok(&["new", "-d", "-s", "beta"]);
+    e.ok(&["new-window", "-t", "beta", "-n", "two"]);
+    e.ok(&["select-window", "-t", "beta:0"]);
+    e.ok(&["send-keys", "-t", "beta:0", "echo BETA-WIN0", "Enter"]);
+    e.ok(&["send-keys", "-t", "beta:1", "echo BETA-WIN1", "Enter"]);
+    assert!(e.until(5.0, || e.capture("beta:0").contains("BETA-WIN0") && e.capture("beta:1").contains("BETA-WIN1")));
+
+    // 2. Reattach by positional name (`amux a beta`), detach, and reattach to `beta:1` and via `new -A`.
+    send_line(&format!("{amux} a beta"));
+    assert!(e.until(5.0, || ui.screen().contains("[beta]") && ui.screen().contains("BETA-WIN0")), "{}", ui.screen());
+    ui.keys(&["C-b", "d"]);
+    assert!(e.until(5.0, || ui.screen().contains("[detached (from session beta)]")), "{}", ui.screen());
+
+    send_line(&format!("{amux} attach -t beta:1"));
+    assert!(e.until(5.0, || ui.screen().contains("[beta]") && ui.screen().contains("BETA-WIN1")), "{}", ui.screen());
+    ui.keys(&["C-b", "d"]);
+    assert!(e.until(5.0, || ui.screen().contains("[detached (from session beta)]")), "{}", ui.screen());
+
+    send_line(&format!("{amux} new -A -s beta"));
+    assert!(e.until(5.0, || ui.screen().contains("[beta]") && ui.screen().contains("BETA-WIN1")), "{}", ui.screen());
+    assert_eq!(e.ok(&["ls"]).lines().count(), 2);
+
+    // 3. Switch sessions via `choose-tree -s` (`prefix s`) and `choose-tree -w` (`prefix w`).
+    ui.keys(&["C-b", "s"]);
+    assert!(e.until(5.0, || ui.screen().contains("choose-tree")), "{}", ui.screen());
+    ui.keys(&["k", "Enter"]);
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]") && ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+
+    ui.keys(&["C-b", "w"]);
+    assert!(e.until(5.0, || ui.screen().contains("choose-tree")), "{}", ui.screen());
+    ui.keys(&["j", "j", "Enter"]);
+    assert!(e.until(5.0, || ui.screen().contains("[beta]") && ui.screen().contains("BETA-WIN0")), "{}", ui.screen());
+
+    // 4. Switch via `prefix L` (last), `prefix )` (next), prompt `:switch-client -t $0`, and CLI `switch-client`.
+    ui.keys(&["C-b", "L"]);
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]")), "{}", ui.screen());
+    ui.keys(&["C-b", ")"]);
+    assert!(e.until(5.0, || ui.screen().contains("[beta]")), "{}", ui.screen());
+    ui.keys(&["C-b", ":"]);
+    assert!(e.until(3.0, || ui.screen().contains(":")), "{}", ui.screen());
+    send_line("switch-client -t $0");
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]")), "{}", ui.screen());
+    e.ok(&["switch-client", "-n"]);
+    assert!(e.until(5.0, || ui.screen().contains("[beta]")), "{}", ui.screen());
+    e.ok(&["switch-client", "-l"]);
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]")), "{}", ui.screen());
+    e.ok(&["switch-client", "beta"]);
+    assert!(e.until(5.0, || ui.screen().contains("[beta]")), "{}", ui.screen());
+
+    // 5. Running `amux a alpha` and `amux new -s gamma` inside an amux pane switches the outer client cleanly.
+    send_line(&format!("{amux} a alpha"));
+    assert!(e.until(5.0, || ui.screen().contains("[alpha]") && ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+    send_line(&format!("{amux} new -s gamma"));
+    assert!(e.until(5.0, || ui.screen().contains("[gamma]")), "{}", ui.screen());
+    assert_eq!(e.ok(&["display", "-p", "-t", "gamma", "#{window_height}"]).trim(), "39");
+
+    // 6. `x` in `choose-tree -s` kills the selected session (`beta`), not the current one (`gamma`).
+    ui.keys(&["C-b", "s"]);
+    assert!(e.until(5.0, || ui.screen().contains("choose-tree")), "{}", ui.screen());
+    ui.keys(&["k", "x"]);
+    assert!(e.until(5.0, || ui.screen().contains("[gamma]") && !e.ok(&["ls"]).contains("beta:")), "{}", ui.screen());
+
+    // 7. `restart-server` and server crashes reconnect to the switched-to session (`gamma`), not `beta`.
+    let old_srv = e.pids(&format!("__server {}", e.name));
+    e.ok(&["restart-server"]);
+    assert!(e.until(10.0, || ui.screen().contains("[gamma]") && e.pids(&format!("__server {}", e.name)) != old_srv), "{}", ui.screen());
+    let _ = e.run(&["panic-test"]);
+    assert!(e.until(10.0, || ui.screen().contains("[gamma]")), "{}", ui.screen());
+}

@@ -619,10 +619,10 @@ impl Server {
                 } else if k == Key::ch('x') {
                     if let Some(it) = items.get(sel).cloned() {
                         let cmd = match it.window {
-                            Some(w) => format!("kill-window -t @{}", w),
-                            None => format!("kill-session -t ${}", it.session),
+                            Some(w) => vec!["kill-window".into(), "-t".into(), format!("@{}", w)],
+                            None => vec!["kill-session".into(), "-t".into(), format!("${}", it.session)],
                         };
-                        self.run_binding(cid, crate::cmd::parse_cmdlist(&cmd, &|_| None).unwrap_or_default());
+                        self.run_binding(cid, vec![cmd]);
                     }
                     return;
                 }
@@ -655,30 +655,20 @@ impl Server {
     }
 
     fn choose_item(&mut self, cid: u32, it: &TreeItem) {
-        let cmd = match it.window {
-            Some(w) => format!("switch-client -t ${} ; select-window -t @{}", it.session, w),
-            None => format!("switch-client -t ${}", it.session),
-        };
-        self.run_binding(cid, crate::cmd::parse_cmdlist(&cmd, &|_| None).unwrap_or_default());
+        let mut cmds = vec![vec!["switch-client".into(), "-t".into(), format!("${}", it.session)]];
+        if let Some(w) = it.window {
+            cmds.push(vec!["select-window".into(), "-t".into(), format!("@{}", w)]);
+        }
+        self.run_binding(cid, cmds);
     }
 
     /// Switch the client to the session/window/pane holding `pid`.
     pub fn jump_to_pane(&mut self, cid: u32, pid: u32) {
         let Some(wid) = self.window_of_pane(pid) else { return };
         let Some(sid) = self.session_of_window(wid) else { return };
-        if let Some(i) = self.client_idx(cid) {
-            let c = &mut self.clients[i];
-            if c.attached != Some(sid) {
-                c.last_session = c.attached;
-                c.attached = Some(sid);
-                c.full_redraw = true;
-            }
-            c.overlay = None;
-            c.dirty = true;
-        }
         self.select_window(sid, wid);
         self.select_pane(pid);
-        self.update_window_sizes();
+        self.attach(cid, sid);
     }
 
     pub fn select_window(&mut self, sid: u32, wid: u32) {
@@ -743,6 +733,22 @@ impl Server {
             if wheel {
                 let k = if btn == 0 { Key::new(Code::Up, 0) } else { Key::new(Code::Down, 0) };
                 self.overlay_key(cid, k);
+            } else if !motion
+                && !m.release
+                && btn == 0
+                && mouse_on
+                && Some(m.y) != status_row
+                && let Some(Overlay::Tree { sel, items }) = &self.clients[i].overlay
+            {
+                let body = rows.saturating_sub(if status_on { 2 } else { 1 }) as usize;
+                let start = sel.saturating_sub(body.saturating_sub(1));
+                let row = m.y.saturating_sub(wy0) as usize;
+                if row >= 1
+                    && let Some(it) = items.get(start + row - 1).cloned()
+                {
+                    self.clients[i].overlay = None;
+                    self.choose_item(cid, &it);
+                }
             }
             return;
         }

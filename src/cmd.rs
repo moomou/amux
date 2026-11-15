@@ -36,13 +36,20 @@ fn tokenize(src: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Tok>,
                 j += 1;
             }
             name = chars[start..j.min(chars.len())].iter().collect();
-            j += 1;
-        } else {
+            if j < chars.len() {
+                j += 1;
+            }
+        } else if j < chars.len() && (chars[j].is_ascii_alphabetic() || chars[j] == '_') {
             let start = j;
             while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
                 j += 1;
             }
             name = chars[start..j].iter().collect();
+        } else {
+            // Bare `$` or tmux session id (`$0`, `$1`, ...): keep literal `$`.
+            word.push('$');
+            *i += 1;
+            return;
         }
         if name.is_empty() {
             word.push('$');
@@ -588,6 +595,7 @@ pub fn resolve_command(name: &str) -> Option<&'static str> {
         "resize-window",
         "respawn-pane",
         "respawn-window",
+        "restart-server",
         "rotate-window",
         "run-shell",
         "save-buffer",
@@ -700,6 +708,7 @@ pub const PUBLIC_COMMANDS: &[&str] = &[
     "resize-window",
     "respawn-pane",
     "respawn-window",
+    "restart-server",
     "rotate-window",
     "run-shell",
     "save-buffer",
@@ -785,6 +794,17 @@ bind x { kill-pane; display "gone" }
     fn semicolons_separate() {
         let l = parse_cmdlist("new -d ; split-window -h", &env).unwrap();
         assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn session_id_dollars_are_preserved() {
+        let l = parse_cmdlist("switch-client -t $1 ; select-window -t @2 ; select-window -t $", &env).unwrap();
+        assert_eq!(l[0], vec!["switch-client", "-t", "$1"]);
+        assert_eq!(l[1], vec!["select-window", "-t", "@2"]);
+        assert_eq!(l[2], vec!["select-window", "-t", "$"]);
+        let q = parse_cmdlist("switch-client -t \"$12:0\" ; display \"$FOO\"", &env).unwrap();
+        assert_eq!(q[0], vec!["switch-client", "-t", "$12:0"]);
+        assert_eq!(q[1], vec!["display", "bar"]);
     }
 
     #[test]
