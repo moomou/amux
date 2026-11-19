@@ -601,16 +601,52 @@ impl Server {
                 }
                 self.clients[i].overlay = Some(Overlay::Agents { sel, tiles, filter });
             }
-            Overlay::Tree { sel, items } => {
+            Overlay::Tree { sel, mut expanded, mut preview } => {
                 if quit {
                     return;
                 }
+                let cur_s = self.clients[i].attached;
+                let items = super::render::tree_items(self, cur_s, &expanded);
                 let n = items.len();
-                let mut sel = sel;
+                let mut sel = sel.min(n.saturating_sub(1));
+                let body_h = self.clients[i].rows.saturating_sub(3) as usize;
+                let page = super::render::tree_list_height(body_h, n, preview).max(1);
                 if down {
                     sel = (sel + 1).min(n.saturating_sub(1));
                 } else if up {
                     sel = sel.saturating_sub(1);
+                } else if matches!(k.code, Code::PageDown) {
+                    sel = (sel + page).min(n.saturating_sub(1));
+                } else if matches!(k.code, Code::PageUp) {
+                    sel = sel.saturating_sub(page);
+                } else if k == Key::ch('g') || matches!(k.code, Code::Home) {
+                    sel = 0;
+                } else if k == Key::ch('G') || matches!(k.code, Code::End) {
+                    sel = n.saturating_sub(1);
+                } else if k == Key::ch('v') {
+                    preview = !preview;
+                } else if matches!(k.code, Code::Right | Code::Tab) || k == Key::ch('l') || k == Key::ch(' ') {
+                    if let Some(it) = items.get(sel)
+                        && it.window.is_none()
+                        && (matches!(k.code, Code::Right) || k == Key::ch('l') || !expanded.remove(&it.session))
+                    {
+                        expanded.insert(it.session);
+                    }
+                } else if matches!(k.code, Code::Left) || k == Key::ch('h') {
+                    if let Some(it) = items.get(sel).cloned() {
+                        expanded.remove(&it.session);
+                        if it.window.is_some() {
+                            let next = super::render::tree_items(self, cur_s, &expanded);
+                            sel = next.iter().position(|x| x.session == it.session && x.window.is_none()).unwrap_or(0);
+                        }
+                    }
+                } else if let Code::Char(c @ '1'..='9') = k.code
+                    && k.mods == 0
+                {
+                    if let Some(it) = items.get(c as usize - '1' as usize).cloned() {
+                        self.choose_item(cid, &it);
+                    }
+                    return;
                 } else if k.code == Code::Enter {
                     if let Some(it) = items.get(sel).cloned() {
                         self.choose_item(cid, &it);
@@ -626,7 +662,7 @@ impl Server {
                     }
                     return;
                 }
-                self.clients[i].overlay = Some(Overlay::Tree { sel, items });
+                self.clients[i].overlay = Some(Overlay::Tree { sel, expanded, preview });
             }
             Overlay::View { title, lines, top } => {
                 if quit {
@@ -738,12 +774,18 @@ impl Server {
                 && btn == 0
                 && mouse_on
                 && Some(m.y) != status_row
-                && let Some(Overlay::Tree { sel, items }) = &self.clients[i].overlay
+                && let Some(Overlay::Tree { sel, expanded, preview }) = &self.clients[i].overlay
             {
-                let body = rows.saturating_sub(if status_on { 2 } else { 1 }) as usize;
-                let start = sel.saturating_sub(body.saturating_sub(1));
+                let cur_s = self.clients[i].attached;
+                let items = super::render::tree_items(self, cur_s, expanded);
+                let h = rows.saturating_sub(if status_on { 1 } else { 0 }) as usize;
+                let body_h = if h >= 4 { h - 2 } else { h.saturating_sub(1) };
+                let list_h = super::render::tree_list_height(body_h, items.len(), *preview);
+                let sel = (*sel).min(items.len().saturating_sub(1));
+                let start = sel.saturating_sub(list_h.saturating_sub(1));
                 let row = m.y.saturating_sub(wy0) as usize;
                 if row >= 1
+                    && row <= list_h
                     && let Some(it) = items.get(start + row - 1).cloned()
                 {
                     self.clients[i].overlay = None;

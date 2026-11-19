@@ -159,7 +159,7 @@ fn build(srv: &Server, c: &Client, spare: Vec<Cell>) -> Canvas {
     let area = Rect { x: 0, y: wy0 as u16, w: w as u16, h: wh as u16 };
     match &c.overlay {
         Some(Overlay::Agents { sel, tiles, filter }) => draw_agents(srv, &mut cv, area, *sel, *tiles, filter),
-        Some(Overlay::Tree { sel, items }) => draw_list(srv, &mut cv, area, "choose-tree", items.iter().map(|i| i.label.clone()).collect(), *sel),
+        Some(Overlay::Tree { sel, expanded, preview }) => draw_tree(srv, &mut cv, area, Some(sid), *sel, expanded, *preview),
         Some(Overlay::View { title, lines, top }) => draw_view(&mut cv, area, title, lines, *top),
         Some(Overlay::Plugins(v)) => draw_plugins(srv, &mut cv, area, v),
         _ => draw_window(srv, c, &mut cv, sess.active, area),
@@ -175,25 +175,34 @@ fn build(srv: &Server, c: &Client, spare: Vec<Cell>) -> Canvas {
     cv
 }
 
-fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) {
-    let Some(win) = srv.windows.get(&wid) else { return };
-    let rects = srv.pane_rects(wid);
-    let ox = area.x as usize;
-    let oy = area.y as usize;
-    let aw = (area.w as usize).min(win.sx as usize);
-    let ah = (area.h as usize).min(win.sy as usize);
+/// Blit `rects` (relative to `area`) and their split borders onto `cv`.
+/// When `scroll_to_tail` is true, taller panes scroll down so active bottom lines remain visible.
+fn blit_panes(srv: &Server, cv: &mut Canvas, wid: u32, area: Rect, rects: &[(u32, Rect)], active_pane: u32, scroll_to_tail: bool) {
+    let (ox, oy, aw, ah) = (area.x as usize, area.y as usize, area.w as usize, area.h as usize);
+    if aw == 0 || ah == 0 {
+        return;
+    }
     let mut covered = vec![false; aw * ah];
-    let mouse_wanted = srv.panes.get(&win.active).map(|p| p.mirror.modes.mouse != 0).unwrap_or(false);
-    cv.mouse |= mouse_wanted;
-    for (pid, r) in &rects {
+    for (pid, r) in rects {
         let Some(p) = srv.panes.get(pid) else { continue };
         let m = &p.mirror;
         let (rx, rw) = (r.x as usize, r.w as usize);
         if rx >= aw || ox + rx >= cv.w {
             continue;
         }
-        // Visible width of this pane on the canvas.
         let vw = rw.min(aw - rx).min(cv.w - ox - rx);
+        let y_start = if !scroll_to_tail || (m.modes.alt_screen && m.cy < r.h as usize) {
+            0
+        } else {
+            let mut last = m.rows;
+            while last > 0 && m.row(last - 1).is_empty() {
+                last -= 1;
+            }
+            if m.cursor_visible && last > 0 {
+                last = last.max((m.cy + 1).min(m.rows));
+            }
+            last.saturating_sub(r.h as usize)
+        };
         for yy in 0..r.h as usize {
             let y = r.y as usize + yy;
             if y >= ah || oy + y >= cv.h {
@@ -201,7 +210,7 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
             }
             covered[y * aw + rx..y * aw + rx + vw].fill(true);
             let dst = (oy + y) * cv.w + ox + rx;
-            let row = m.row(yy);
+            let row = m.row(y_start + yy);
             let n = vw.min(row.len());
             if n > 0 {
                 let src = &row[..n];
@@ -229,14 +238,15 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
             }
         }
     }
-    // Borders: every uncovered cell inside the window (none for one pane).
+    if rects.len() <= 1 {
+        return;
+    }
     let sid = srv.session_of_window(wid);
-    let single = rects.len() == 1;
     let normal = style_of(&srv.opt(sid, Some(wid), "pane-border-style"), Style::DEFAULT);
     let active = style_of(&srv.opt(sid, Some(wid), "pane-active-border-style"), Style::DEFAULT);
-    let ar = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
+    let ar = rects.iter().find(|(p, _)| *p == active_pane).map(|(_, r)| *r);
     let is_b = |x: isize, y: isize| -> bool { x >= 0 && y >= 0 && (x as usize) < aw && (y as usize) < ah && !covered[y as usize * aw + x as usize] };
-    for y in 0..if single { 0 } else { ah } {
+    for y in 0..ah {
         for x in 0..aw {
             if covered[y * aw + x] {
                 continue;
@@ -263,10 +273,23 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
             let act = ar.is_some_and(|a| {
                 let (ax, ay, aw2, ah2) = (a.x as isize - 1, a.y as isize - 1, a.w as isize + 2, a.h as isize + 2);
                 xi >= ax && xi < ax + aw2 && yi >= ay && yi < ay + ah2
-            }) && rects.len() > 1;
+            });
             cv.set(ox + x, oy + y, Cell::with_style(ch as u32, if act { active } else { normal }));
         }
     }
+}
+
+fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) {
+    let Some(win) = srv.windows.get(&wid) else { return };
+    let rects = srv.pane_rects(wid);
+    let ox = area.x as usize;
+    let oy = area.y as usize;
+    let aw = (area.w as usize).min(win.sx as usize);
+    let ah = (area.h as usize).min(win.sy as usize);
+    let mouse_wanted = srv.panes.get(&win.active).map(|p| p.mirror.modes.mouse != 0).unwrap_or(false);
+    cv.mouse |= mouse_wanted;
+    blit_panes(srv, cv, wid, Rect { x: area.x, y: area.y, w: aw as u16, h: ah as u16 }, &rects, win.active, false);
+    let ar = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
     // display-panes overlay
     if let Some(Overlay::Panes { .. }) = &c.overlay {
         let base = srv.gnum("pane-base-index", 0).max(0) as usize;
@@ -740,19 +763,178 @@ fn draw_plugins(srv: &Server, cv: &mut Canvas, area: Rect, v: &plugins::View) {
     }
 }
 
-fn draw_list(_srv: &Server, cv: &mut Canvas, area: Rect, title: &str, items: Vec<String>, sel: usize) {
+/// Visible tree rows for `choose-tree`, built live from current sessions and windows.
+pub fn tree_items(srv: &Server, cur_sid: Option<u32>, expanded: &std::collections::HashSet<u32>) -> Vec<super::TreeItem> {
+    let mut items = Vec::new();
+    for s in &srv.sessions {
+        let open = expanded.contains(&s.id);
+        let arrow = if open { "▾" } else { "▸" };
+        let wword = if s.windows.len() == 1 { "window" } else { "windows" };
+        let att = if Some(s.id) == cur_sid || srv.clients.iter().any(|c| c.attached == Some(s.id)) { " (attached)" } else { "" };
+        let mut acounts = [0usize; 5];
+        for (_, wid) in &s.windows {
+            if let Some(w) = srv.windows.get(wid) {
+                for pid in w.layout.panes() {
+                    if let Some(p) = srv.panes.get(&pid).filter(|p| p.agent.agent.is_some()) {
+                        acounts[p.agent.state as usize] += 1;
+                    }
+                }
+            }
+        }
+        let mut agents = String::new();
+        for st in [AState::Waiting, AState::Working, AState::Done] {
+            let n = acounts[st as usize];
+            if n > 0 {
+                agents.push_str(&format!("  {}{}", st.icon(), n));
+            }
+        }
+        items.push(super::TreeItem { label: format!("{} {}: {} {}{}{}", arrow, s.name, s.windows.len(), wword, att, agents), session: s.id, window: None });
+        if open {
+            let wn = s.windows.len();
+            for (k, (idx, wid)) in s.windows.iter().enumerate() {
+                let branch = if k + 1 == wn { "└─" } else { "├─" };
+                let flag = if *wid == s.active {
+                    "*"
+                } else if s.last == Some(*wid) {
+                    "-"
+                } else {
+                    ""
+                };
+                let panes_n = srv.windows.get(wid).map_or(1, |w| w.layout.panes().len());
+                let panes = if panes_n > 1 { format!(" ({} panes)", panes_n) } else { String::new() };
+                let agent = srv
+                    .windows
+                    .get(wid)
+                    .and_then(|ww| srv.panes.get(&ww.active))
+                    .filter(|p| p.agent.agent.is_some())
+                    .map(|p| format!("  {} {}", p.agent.state.icon(), p.agent.state.label().to_lowercase()))
+                    .unwrap_or_default();
+                items.push(super::TreeItem {
+                    label: format!("  {} {}: {}{}{}{}", branch, idx, srv.window_name(*wid), flag, panes, agent),
+                    session: s.id,
+                    window: Some(*wid),
+                });
+            }
+        }
+    }
+    items
+}
+
+/// Number of rows allocated to the tree list inside `body_h`.
+pub fn tree_list_height(body_h: usize, items_len: usize, preview: bool) -> usize {
+    if !preview || body_h < 6 {
+        return body_h;
+    }
+    items_len.clamp(1, (body_h * 2 / 5).max(3))
+}
+
+fn draw_window_preview(srv: &Server, cv: &mut Canvas, wid: u32, area: Rect) {
+    if area.w == 0 || area.h == 0 {
+        return;
+    }
+    let Some(win) = srv.windows.get(&wid) else { return };
+    let mut rects = Vec::new();
+    if win.zoomed || win.layout.panes().len() <= 1 {
+        rects.push((win.active, Rect { x: 0, y: 0, w: area.w, h: area.h }));
+    } else {
+        let mut scaled = win.layout.clone();
+        scaled.fit(area.w.max(2), area.h.max(1));
+        scaled.layout(Rect { x: 0, y: 0, w: area.w, h: area.h }, &mut rects);
+    }
+    blit_panes(srv, cv, wid, area, &rects, win.active, true);
+}
+
+fn draw_tree(srv: &Server, cv: &mut Canvas, area: Rect, cur_sid: Option<u32>, sel: usize, expanded: &std::collections::HashSet<u32>, preview: bool) {
     let (x0, y0, w, h) = (area.x as usize, area.y as usize, area.w as usize, area.h as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let items = tree_items(srv, cur_sid, expanded);
+    let win_total: usize = srv.sessions.iter().map(|s| s.windows.len()).sum();
     let head = Style { fg: color_idx(15) | BOLD, bg: color_idx(236) };
     cv.fill(x0, y0, x0 + w, head);
-    cv.text(x0, y0, &format!(" {} (enter: select, x: kill, q: cancel)", title), head, x0 + w);
-    let body = h.saturating_sub(1);
-    let start = sel.saturating_sub(body.saturating_sub(1));
-    for (i, it) in items.iter().enumerate().skip(start).take(body) {
-        let y = y0 + 1 + i - start;
-        let st = if i == sel { Style { fg: color_idx(0), bg: color_idx(3) } } else { Style::DEFAULT };
-        cv.fill(x0, y, x0 + w, st);
-        cv.text(x0 + 1, y, it, st, x0 + w);
+    cv.text(x0, y0, &format!(" choose-tree · {} sessions · {} windows ", srv.sessions.len(), win_total), head, x0 + w);
+    let has_foot = h >= 4;
+    if has_foot {
+        let fy = y0 + h - 1;
+        let foot = Style { fg: color_idx(250), bg: color_idx(236) };
+        cv.fill(x0, fy, x0 + w, foot);
+        cv.text(x0, fy, " enter/1-9:jump  j/k:move  l/h/space:windows  v:preview  x:kill  q:cancel ", foot, x0 + w);
     }
+    let body_h = if has_foot { h - 2 } else { h.saturating_sub(1) };
+    if items.is_empty() || body_h == 0 {
+        return;
+    }
+    let sel = sel.min(items.len() - 1);
+    let list_h = tree_list_height(body_h, items.len(), preview);
+    let start = sel.saturating_sub(list_h.saturating_sub(1));
+    for (i, it) in items.iter().enumerate().skip(start).take(list_h) {
+        let y = y0 + 1 + i - start;
+        let selected = i == sel;
+        let bg = if selected { color_idx(3) } else { 0 };
+        let num_st = if selected { Style { fg: color_idx(0), bg } } else { Style { fg: color_idx(244), bg } };
+        let txt_st = if selected {
+            Style { fg: color_idx(0) | BOLD, bg }
+        } else if it.window.is_none() {
+            Style { fg: color_idx(255) | BOLD, bg }
+        } else {
+            Style { fg: color_idx(250), bg }
+        };
+        cv.fill(x0, y, x0 + w, Style { fg: 0, bg });
+        let num = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+        let x = cv.text(x0 + 1, y, &num, num_st, x0 + w);
+        cv.text(x, y, &it.label, txt_st, x0 + w);
+    }
+    if !preview || body_h < 6 {
+        return;
+    }
+    let py = y0 + 1 + list_h;
+    let fy_end = if has_foot { y0 + h - 1 } else { y0 + h };
+    if py + 2 > fy_end {
+        return;
+    }
+    let it = &items[sel];
+    let sess = srv.sessions.iter().find(|s| s.id == it.session);
+    let Some(wid) = it.window.or_else(|| sess.map(|s| s.active)) else { return };
+    let border = Style { fg: color_idx(240), bg: 0 };
+    for x in x0..x0 + w {
+        cv.set(x, py, Cell::with_style('─' as u32, border));
+    }
+    let sname = sess.map(|s| s.name.as_str()).unwrap_or("?");
+    let cwd = srv.windows.get(&wid).and_then(|win| srv.panes.get(&win.active)).map(|p| short_path(&p.meta.cwd)).unwrap_or_default();
+    let mut x = cv.text(x0 + 1, py, &format!(" preview [{}] ", sname), Style { fg: color_idx(252) | BOLD, bg: 0 }, x0 + w);
+    match (it.window, sess) {
+        (None, Some(s)) => {
+            for (idx, w_id) in &s.windows {
+                let active = *w_id == s.active;
+                let flag = if active {
+                    "*"
+                } else if s.last == Some(*w_id) {
+                    "-"
+                } else {
+                    ""
+                };
+                let st = if active { Style { fg: color_idx(117) | BOLD, bg: 0 } } else { Style { fg: color_idx(246), bg: 0 } };
+                x = cv.text(x, py, &format!("{}:{}{}  ", idx, srv.window_name(*w_id), flag), st, x0 + w);
+            }
+        }
+        (Some(w_id), Some(s)) => {
+            let idx = s.index_of(w_id).unwrap_or(0);
+            let panes_n = srv.windows.get(&w_id).map_or(1, |win| win.layout.panes().len());
+            x = cv.text(
+                x,
+                py,
+                &format!("{}:{} ({} pane{}) ", idx, srv.window_name(w_id), panes_n, if panes_n == 1 { "" } else { "s" }),
+                Style { fg: color_idx(117) | BOLD, bg: 0 },
+                x0 + w,
+            );
+        }
+        _ => {}
+    }
+    if !cwd.is_empty() && x + cwd.len() + 2 < x0 + w {
+        cv.text(x, py, &format!("{} ", cwd), Style { fg: color_idx(244), bg: 0 }, x0 + w);
+    }
+    draw_window_preview(srv, cv, wid, Rect { x: area.x, y: (py + 1) as u16, w: area.w, h: (fy_end - py - 1) as u16 });
 }
 
 fn draw_view(cv: &mut Canvas, area: Rect, title: &str, lines: &[String], top: usize) {

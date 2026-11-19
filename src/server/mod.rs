@@ -131,7 +131,7 @@ pub struct Prompt {
 
 pub enum Overlay {
     Agents { sel: usize, tiles: bool, filter: String },
-    Tree { sel: usize, items: Vec<TreeItem> },
+    Tree { sel: usize, expanded: std::collections::HashSet<u32>, preview: bool },
     View { title: String, lines: Vec<String>, top: usize },
     Panes { until: Instant },
     Plugins(plugins::View),
@@ -142,7 +142,6 @@ pub struct TreeItem {
     pub label: String,
     pub session: u32,
     pub window: Option<u32>,
-    pub depth: u8,
 }
 
 /// Optional start-up state for a new pane's keeper.
@@ -1057,7 +1056,7 @@ impl Server {
     pub fn redraw_window(&mut self, wid: u32) {
         let sid = self.session_of_window(wid);
         for c in &mut self.clients {
-            if c.attached.is_some() && c.attached == sid {
+            if c.attached.is_some() && (c.attached == sid || matches!(c.overlay, Some(Overlay::Tree { .. } | Overlay::Agents { .. }))) {
                 c.dirty = true;
             }
         }

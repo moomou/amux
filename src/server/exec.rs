@@ -1,7 +1,7 @@
 //! Command execution: tmux commands, targets, formats, jobs and waits.
 
 use super::render;
-use super::{Client, Job, Overlay, Server, TreeItem, Wait};
+use super::{Client, Job, Overlay, Server, Wait};
 use crate::agents::{self, State as AState};
 use crate::cmd::{Args, resolve_command};
 use crate::format::{self, Vars};
@@ -2201,37 +2201,17 @@ impl Server {
                 let a = args!("GNrswZF:f:K:O:t:");
                 let prefer = self.caller_pane_here(cid).and_then(|p| self.window_of_pane(p)).and_then(|w| self.session_of_window(w));
                 let tcid = self.target_attached_client(cid, prefer).ok_or("choose-tree needs an attached client")?;
-                let mut items = Vec::new();
                 let (cur_s, cur_w, _) = self.current(tcid);
-                let mut sel = 0;
-                for s in &self.sessions {
-                    if Some(s.id) == cur_s && !a.has('w') {
-                        sel = items.len();
-                    }
-                    items.push(TreeItem {
-                        label: format!("{}: {} windows{}", s.name, s.windows.len(), if Some(s.id) == cur_s { " (attached)" } else { "" }),
-                        session: s.id,
-                        window: None,
-                        depth: 0,
-                    });
-                    if a.has('w') || !a.has('s') {
-                        for (idx, w) in &s.windows {
-                            if Some(*w) == cur_w {
-                                sel = items.len();
-                            }
-                            let agent = self
-                                .windows
-                                .get(w)
-                                .and_then(|ww| self.panes.get(&ww.active))
-                                .filter(|p| p.agent.agent.is_some())
-                                .map(|p| format!("  {} {}", p.agent.state.icon(), p.agent.state.label().to_lowercase()))
-                                .unwrap_or_default();
-                            items.push(TreeItem { label: format!("  {}: {}{}", idx, self.window_name(*w), agent), session: s.id, window: Some(*w), depth: 1 });
-                        }
-                    }
-                }
+                let expanded: std::collections::HashSet<u32> =
+                    if a.has('w') || !a.has('s') { self.sessions.iter().map(|s| s.id).collect() } else { std::collections::HashSet::new() };
+                let items = render::tree_items(self, cur_s, &expanded);
+                let sel = items
+                    .iter()
+                    .position(|it| if expanded.is_empty() { Some(it.session) == cur_s } else { it.window == cur_w && cur_w.is_some() })
+                    .or_else(|| items.iter().position(|it| Some(it.session) == cur_s))
+                    .unwrap_or(0);
                 if let Some(i) = self.client_idx(tcid) {
-                    self.clients[i].overlay = Some(Overlay::Tree { sel, items });
+                    self.clients[i].overlay = Some(Overlay::Tree { sel, expanded, preview: !a.has('N') });
                     self.clients[i].dirty = true;
                 }
                 Ok(Flow::Next)

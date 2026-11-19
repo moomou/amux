@@ -1119,9 +1119,39 @@ fn session_reattach_and_switching_work_across_cli_keys_and_tree() {
     assert!(e.until(5.0, || ui.screen().contains("[beta]") && ui.screen().contains("BETA-WIN1")), "{}", ui.screen());
     assert_eq!(e.ok(&["ls"]).lines().count(), 2);
 
-    // 3. Switch sessions via `choose-tree -s` (`prefix s`) and `choose-tree -w` (`prefix w`).
+    // 3. `choose-tree` (`prefix s` / `prefix w`): live preview, `v` toggle, inline expand/collapse, and multi-pane split preview.
+    e.ok(&["split-window", "-h", "-t", "beta:0"]);
+    e.ok(&["send-keys", "-t", "beta:0.1", "echo BETA-SPLIT-RIGHT", "Enter"]);
+    assert!(e.until(5.0, || e.capture("beta:0.1").contains("BETA-SPLIT-RIGHT")));
+
     ui.keys(&["C-b", "s"]);
-    assert!(e.until(5.0, || ui.screen().contains("choose-tree")), "{}", ui.screen());
+    assert!(
+        e.until(5.0, || ui.screen().contains("choose-tree") && ui.screen().contains("preview [beta]") && ui.screen().contains("BETA-WIN1")),
+        "{}",
+        ui.screen()
+    );
+    ui.keys(&["k"]);
+    assert!(e.until(5.0, || ui.screen().contains("preview [alpha]") && ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+    ui.keys(&["v"]);
+    assert!(e.until(5.0, || !ui.screen().contains("preview [alpha]") && !ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+    ui.keys(&["v"]);
+    assert!(e.until(5.0, || ui.screen().contains("preview [alpha]") && ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
+    // Expand `beta` inline with `l`, preview its split window `0` (plus live output updates) and window `1`, then collapse with `h`.
+    ui.keys(&["j", "l", "j"]);
+    assert!(
+        e.until(5.0, || {
+            let s = ui.screen();
+            s.contains("(2 panes)") && s.contains("BETA-WIN0") && s.contains("BETA-SPLIT-RIGHT") && s.contains('│')
+        }),
+        "{}",
+        ui.screen()
+    );
+    e.ok(&["send-keys", "-t", "beta:0.1", "echo LIVE-STREAM-77", "Enter"]);
+    assert!(e.until(5.0, || ui.screen().contains("LIVE-STREAM-77")), "{}", ui.screen());
+    ui.keys(&["j"]);
+    assert!(e.until(5.0, || ui.screen().contains("BETA-WIN1")), "{}", ui.screen());
+    ui.keys(&["h"]);
+    assert!(e.until(5.0, || ui.screen().contains("▸ beta:") && !ui.screen().contains("(2 panes)")), "{}", ui.screen());
     ui.keys(&["k", "Enter"]);
     assert!(e.until(5.0, || ui.screen().contains("[alpha]") && ui.screen().contains("ALPHA-ONE")), "{}", ui.screen());
 
