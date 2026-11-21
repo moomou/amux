@@ -351,6 +351,43 @@ pub fn parse_colour(s: &str) -> Option<u32> {
         let v = u32::from_str_radix(h, 16).ok()?;
         return Some(color_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
     }
+    if let Some(pct) = s.strip_prefix("grey").or_else(|| s.strip_prefix("gray"))
+        && !pct.is_empty()
+        && let Ok(n) = pct.parse::<u8>()
+        && n <= 100
+    {
+        let v = ((n as u32 * 255 + 50) / 100) as u8;
+        return Some(color_rgb(v, v, v));
+    }
+    const X11: &[(&str, (u8, u8, u8))] = &[
+        ("grey", (190, 190, 190)),
+        ("gray", (190, 190, 190)),
+        ("lightgrey", (211, 211, 211)),
+        ("lightgray", (211, 211, 211)),
+        ("darkgrey", (169, 169, 169)),
+        ("darkgray", (169, 169, 169)),
+        ("orange", (255, 165, 0)),
+        ("purple", (160, 32, 240)),
+        ("pink", (255, 192, 203)),
+        ("brown", (165, 42, 42)),
+        ("navy", (0, 0, 128)),
+        ("teal", (0, 128, 128)),
+        ("silver", (192, 192, 192)),
+        ("olive", (128, 128, 0)),
+        ("maroon", (176, 48, 96)),
+        ("lime", (0, 255, 0)),
+        ("aqua", (0, 255, 255)),
+        ("fuchsia", (255, 0, 255)),
+        ("indigo", (75, 0, 130)),
+        ("violet", (238, 130, 238)),
+        ("gold", (255, 215, 0)),
+        ("coral", (255, 127, 80)),
+        ("crimson", (220, 20, 60)),
+        ("salmon", (250, 128, 114)),
+    ];
+    if let Some(&(_, (r, g, b))) = X11.iter().find(|(n, _)| *n == s) {
+        return Some(color_rgb(r, g, b));
+    }
     if let Ok(n) = s.parse::<u8>() {
         return Some(color_idx(n));
     }
@@ -366,24 +403,41 @@ pub enum Align {
     Right,
 }
 
-/// Apply a style string (e.g. "fg=red,bg=default,bold") to `base`.
-pub fn apply_style(spec: &str, mut st: Style) -> (Style, Align, Option<u32>) {
+/// Apply a style string onto `st`, where `"default"`/`"none"`/`fg=default`/`bg=default`
+/// inherit from `base` and `fg=terminal`/`bg=terminal` select the terminal's own defaults.
+pub fn apply_style_onto(spec: &str, mut st: Style, base: Style) -> (Style, Align, Option<u32>) {
     let mut align = Align::None;
     let mut fill = None;
     for part in spec.split([',', ' ']).map(|p| p.trim()).filter(|p| !p.is_empty()) {
         let (k, val) = part.split_once('=').unwrap_or((part, ""));
         match k {
             "fg" => {
-                if let Some(c) = parse_colour(val) {
-                    st.set_fg(c)
+                if val.trim().eq_ignore_ascii_case("default") {
+                    st.set_fg(base.fg);
+                } else if val.trim().eq_ignore_ascii_case("terminal") {
+                    st.set_fg(0);
+                } else if let Some(c) = parse_colour(val) {
+                    st.set_fg(c);
                 }
             }
             "bg" => {
-                if let Some(c) = parse_colour(val) {
-                    st.set_bg(c)
+                if val.trim().eq_ignore_ascii_case("default") {
+                    st.set_bg(base.bg);
+                } else if val.trim().eq_ignore_ascii_case("terminal") {
+                    st.set_bg(0);
+                } else if let Some(c) = parse_colour(val) {
+                    st.set_bg(c);
                 }
             }
-            "fill" => fill = parse_colour(val),
+            "fill" => {
+                fill = if val.trim().eq_ignore_ascii_case("default") {
+                    Some(base.bg)
+                } else if val.trim().eq_ignore_ascii_case("terminal") {
+                    Some(0)
+                } else {
+                    parse_colour(val)
+                };
+            }
             "align" => {
                 align = match val {
                     "left" => Align::Left,
@@ -392,7 +446,7 @@ pub fn apply_style(spec: &str, mut st: Style) -> (Style, Align, Option<u32>) {
                     _ => Align::None,
                 }
             }
-            "default" | "none" => st = Style::DEFAULT,
+            "default" | "none" => st = base,
             "bright" | "bold" => st.fg |= BOLD,
             "nobright" | "nobold" => st.fg &= !BOLD,
             "dim" => st.fg |= DIM,
@@ -421,6 +475,11 @@ pub fn apply_style(spec: &str, mut st: Style) -> (Style, Align, Option<u32>) {
     (st, align, fill)
 }
 
+/// Apply a style string (e.g. "fg=red,bg=default,bold") to `base`.
+pub fn apply_style(spec: &str, base: Style) -> (Style, Align, Option<u32>) {
+    apply_style_onto(spec, base, base)
+}
+
 /// A run of styled text with an alignment section.
 #[derive(Clone, Debug)]
 pub struct Span {
@@ -447,17 +506,13 @@ pub fn spans(s: &str, base: Style) -> (Vec<Span>, Option<u32>) {
                 out.push(Span { style: st, text: std::mem::take(&mut cur), align });
             }
             let inner: String = c[i + 2..i + end].iter().collect();
-            if inner.trim() == "default" {
-                st = base;
-            } else {
-                let (ns, a, f) = apply_style(&inner, st);
-                st = ns;
-                if a != Align::None {
-                    align = a;
-                }
-                if f.is_some() {
-                    fill = f;
-                }
+            let (ns, a, f) = apply_style_onto(&inner, st, base);
+            st = ns;
+            if a != Align::None {
+                align = a;
+            }
+            if f.is_some() {
+                fill = f;
             }
             i += end + 1;
             continue;
@@ -505,17 +560,28 @@ mod tests {
 
     #[test]
     fn styles() {
-        let (st, _, _) = apply_style("bg=green,fg=black", Style::DEFAULT);
-        assert_eq!(st.bg_color(), Color::Idx(2));
-        assert_eq!(st.fg_color(), Color::Idx(0));
+        let (base, _, _) = apply_style("bg=green,fg=black", Style::DEFAULT);
+        assert_eq!(base.bg_color(), Color::Idx(2));
+        assert_eq!(base.fg_color(), Color::Idx(0));
+        // Sub-styles set to "default" inherit the parent status style rather than resetting to black.
+        assert_eq!(apply_style("default", base).0, base);
+        assert_eq!(apply_style("bg=white", base).0, Style { fg: color_idx(0), bg: color_idx(7) });
+        assert_eq!(apply_style("bg=terminal,fg=terminal", base).0, Style::DEFAULT);
         let (st, _, _) = apply_style("bg=colour123,fg=#ff0000,bold", Style::DEFAULT);
         assert_eq!(st.bg_color(), Color::Idx(123));
         assert_eq!(st.fg_color(), Color::Rgb(255, 0, 0));
         assert!(st.has(BOLD));
-        let (sp, _) = spans("a#[fg=red]b#[default]c", Style::DEFAULT);
-        assert_eq!(sp.len(), 3);
-        assert_eq!(sp[1].style.fg_color(), Color::Idx(1));
-        assert_eq!(sp[2].style, Style::DEFAULT);
+        assert_eq!(parse_colour("grey"), Some(color_rgb(190, 190, 190)));
+        assert_eq!(parse_colour("grey20"), Some(color_rgb(51, 51, 51)));
+        assert_eq!(parse_colour("orange"), Some(color_rgb(255, 165, 0)));
+        let (sp, _) = spans("a#[fg=red]b#[default]c#[fg=default]d#[default,bold]e#[bg=terminal,fg=terminal]f", base);
+        assert_eq!(sp.len(), 6);
+        assert_eq!(sp[0].style, base);
+        assert_eq!(sp[1].style, Style { fg: color_idx(1), bg: color_idx(2) });
+        assert_eq!(sp[2].style, base);
+        assert_eq!(sp[3].style, base);
+        assert_eq!(sp[4].style, Style { fg: color_idx(0) | BOLD, bg: color_idx(2) });
+        assert_eq!(sp[5].style, Style { fg: BOLD, bg: 0 });
     }
 
     #[test]

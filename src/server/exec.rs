@@ -2593,6 +2593,17 @@ impl Server {
             if matches!(name.as_str(), "prefix" | "prefix2") && v != "None" && parse_key_name(&v).is_none() {
                 return Err(format!("bad key: {}", v));
             }
+            if !a.has('a')
+                && let Some(stem) = name.strip_suffix("-style")
+                && matches!(stem, "status" | "window-status" | "window-status-current")
+            {
+                if v.contains("bg=") || v.contains("default") || v.contains("none") {
+                    map.remove(&format!("{}-bg", stem));
+                }
+                if v.contains("fg=") || v.contains("default") || v.contains("none") {
+                    map.remove(&format!("{}-fg", stem));
+                }
+            }
             map.insert(name.clone(), v);
         }
         if matches!(name.as_str(), "status" | "status-position") {

@@ -106,7 +106,13 @@ pub fn render(srv: &mut Server, ci: usize) -> Vec<u8> {
         build(srv, &srv.clients[ci], spare)
     };
     let _t = crate::util::prof::time(crate::util::prof::DIFF);
+    let tc_opt = {
+        let to = srv.gopt("terminal-overrides");
+        let tf = srv.gopt("terminal-features");
+        to.contains("Tc") || to.contains("RGB") || tf.contains("RGB")
+    };
     let c = &mut srv.clients[ci];
+    c.truecolor |= tc_opt;
     if let Some(sc) = cv.status_new.take() {
         c.status_cache = Some(sc);
     }
@@ -320,18 +326,34 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
     }
 }
 
+fn apply_bg_fg(srv: &Server, sid: Option<u32>, wid: Option<u32>, st: &mut Style, bg_key: &str, fg_key: &str) {
+    let bg = srv.opt(sid, wid, bg_key);
+    if !bg.is_empty()
+        && !bg.eq_ignore_ascii_case("default")
+        && let Some(c) = format::parse_colour(&bg)
+    {
+        st.set_bg(c);
+    }
+    let fg = srv.opt(sid, wid, fg_key);
+    if !fg.is_empty()
+        && !fg.eq_ignore_ascii_case("default")
+        && let Some(c) = format::parse_colour(&fg)
+    {
+        st.set_fg(c);
+    }
+}
+
 fn draw_status(srv: &Server, c: &Client, sid: u32, cv: &mut Canvas, row: usize) {
     let w = cv.w;
-    let mut base = style_of(&srv.opt(Some(sid), None, "status-style"), Style::DEFAULT);
-    if let Some(bg) = srv.options.global.get("status-bg").and_then(|v| format::parse_colour(v)) {
-        base.set_bg(bg);
+    let (mut base, _, fill) = format::apply_style(&srv.opt(Some(sid), None, "status-style"), Style::DEFAULT);
+    apply_bg_fg(srv, Some(sid), None, &mut base, "status-bg", "status-fg");
+    let mut fill_st = base;
+    if let Some(f) = fill {
+        fill_st.set_bg(f);
     }
-    if let Some(fg) = srv.options.global.get("status-fg").and_then(|v| format::parse_colour(v)) {
-        base.set_fg(fg);
-    }
-    cv.fill(0, row, w, base);
+    cv.fill(0, row, w, fill_st);
     if let Some(p) = &c.prompt {
-        let st = style_of(&srv.gopt("message-style"), base);
+        let st = style_of(&srv.opt(Some(sid), None, "message-style"), base);
         cv.fill(0, row, w, st);
         let x = cv.text(0, row, &p.label, st, w);
         cv.text(x, row, &p.text, st, w);
@@ -342,7 +364,7 @@ fn draw_status(srv: &Server, c: &Client, sid: u32, cv: &mut Canvas, row: usize) 
         return;
     }
     if let Some((m, _)) = &c.message {
-        let st = style_of(&srv.gopt("message-style"), base);
+        let st = style_of(&srv.opt(Some(sid), None, "message-style"), base);
         cv.fill(0, row, w, st);
         cv.text(0, row, m, st, w);
         return;
@@ -390,12 +412,16 @@ fn draw_status(srv: &Server, c: &Client, sid: u32, cv: &mut Canvas, row: usize) 
         let current = *wid == sess.active;
         let fmt = srv.opt(Some(sid), Some(*wid), if current { "window-status-current-format" } else { "window-status-format" });
         let mut st = style_of(&srv.opt(Some(sid), Some(*wid), "window-status-style"), base);
+        apply_bg_fg(srv, Some(sid), Some(*wid), &mut st, "window-status-bg", "window-status-fg");
         if current {
             st = style_of(&srv.opt(Some(sid), Some(*wid), "window-status-current-style"), st);
+            apply_bg_fg(srv, Some(sid), Some(*wid), &mut st, "window-status-current-bg", "window-status-current-fg");
         } else if win.bell {
             st = style_of(&srv.opt(Some(sid), Some(*wid), "window-status-bell-style"), st);
         } else if win.activity && srv.opt(Some(sid), Some(*wid), "monitor-activity") == "on" {
             st = style_of(&srv.opt(Some(sid), Some(*wid), "window-status-activity-style"), st);
+        } else if sess.last == Some(*wid) {
+            st = style_of(&srv.opt(Some(sid), Some(*wid), "window-status-last-style"), st);
         }
         let wfv = Fv { srv, client: Some(c), sid: Some(sid), wid: Some(*wid), pid: Some(win.active), idx: Some(*idx) };
         let text = format::expand(&fmt, &wfv);

@@ -681,6 +681,11 @@ impl Outer {
         let o = Command::new("tmux").args(["-S", &self.sock, "capture-pane", "-p", "-t", "ui"]).env_remove("TMUX").output();
         o.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
     }
+
+    fn screen_ansi(&self) -> String {
+        let o = Command::new("tmux").args(["-S", &self.sock, "capture-pane", "-p", "-e", "-t", "ui"]).env_remove("TMUX").output();
+        o.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    }
 }
 
 impl Drop for Outer {
@@ -1195,4 +1200,46 @@ fn session_reattach_and_switching_work_across_cli_keys_and_tree() {
     assert!(e.until(10.0, || ui.screen().contains("[gamma]") && e.pids(&format!("__server {}", e.name)) != old_srv), "{}", ui.screen());
     let _ = e.run(&["panic-test"]);
     assert!(e.until(10.0, || ui.screen().contains("[gamma]")), "{}", ui.screen());
+}
+
+#[test]
+fn status_bar_colors_propagate_across_all_segments() {
+    if !tmux_ok() {
+        eprintln!("tmux not found; skipping");
+        return;
+    }
+    let e = Env::new("statuscolor", None);
+    e.ok(&["new", "-d", "-s", "work"]);
+    let ui = Outer::start(&e, "work");
+    let status_ansi = || ui.screen_ansi().lines().last().unwrap_or_default().to_string();
+
+    // Non-black `status-style` must style left, window list, filler, and right (never dropping back to \x1b[49m/\x1b[39m).
+    e.ok(&["set", "-g", "status-style", "bg=colour33,fg=yellow"]);
+    e.ok(&["status", "set", "-t", "%0", "waiting", "check"]);
+    assert!(
+        e.until(5.0, || {
+            let line = status_ansi();
+            line.contains("48;5;33")
+                && line.contains("[work]")
+                && line.contains("▲1")
+                && !line.starts_with("[work]")
+                && !line.contains("\x1b[49m")
+                && !line.contains("\x1b[39m")
+        }),
+        "bad status ANSI: {:?}",
+        status_ansi()
+    );
+
+    // Per-session `status-bg` overrides, and a subsequent `status-style` cleanly replaces it.
+    e.ok(&["set", "-t", "work", "status-bg", "red"]);
+    assert!(e.until(5.0, || status_ansi().contains("\x1b[41m") && !status_ansi().contains("\x1b[49m")), "bad status-bg ANSI: {:?}", status_ansi());
+    e.ok(&["set", "-t", "work", "status-style", "bg=blue,fg=white"]);
+    assert!(
+        e.until(5.0, || {
+            let line = status_ansi();
+            line.contains("\x1b[44m") && line.contains("\x1b[37m") && !line.contains("\x1b[41m") && !line.contains("\x1b[49m")
+        }),
+        "bad replacement status-style ANSI: {:?}",
+        status_ansi()
+    );
 }

@@ -1441,7 +1441,9 @@ impl Server {
                 c.cols = cols.max(2);
                 c.rows = rows.max(2);
                 c.term = term;
-                c.truecolor = colorterm == "truecolor" || colorterm == "24bit";
+                c.truecolor = colorterm == "truecolor"
+                    || colorterm == "24bit"
+                    || matches!(c.term.as_str(), "xterm-kitty" | "xterm-ghostty" | "wezterm" | "alacritty" | "foot" | "foot-extra");
                 c.cwd = cwd;
                 c.pid = pid;
                 c.caller_pane =
