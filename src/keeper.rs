@@ -79,6 +79,8 @@ struct Keeper {
     /// Cursor and modes as last sent: a change to them alone (a program
     /// moving the cursor, or asking for bracketed paste) needs a frame too.
     sent_view: View,
+    sent_images: Vec<(u64, u16, u16, u16, u16)>,
+    sent_image_ids: HashSet<u64>,
     inq: Vec<u8>,
     proc_last: Option<(u32, String, String)>,
     proc_due: Option<Instant>,
@@ -174,6 +176,8 @@ fn run(spec: Spec) -> io::Result<()> {
         need_full: true,
         last_frame: Instant::now() - FRAME_INTERVAL,
         sent_view: View::default(),
+        sent_images: Vec::new(),
+        sent_image_ids: HashSet::new(),
         inq: Vec::new(),
         proc_last: None,
         proc_due: Some(Instant::now() + PROC_DELAY),
@@ -286,8 +290,17 @@ impl Keeper {
         d
     }
 
+    fn current_images(&self) -> &[crate::term::Image] {
+        if self.copy.active { &[] } else { &self.emu.term.images }
+    }
+
+    fn images_dirty(&self) -> bool {
+        let cur = self.current_images();
+        cur.len() != self.sent_images.len() || cur.iter().zip(&self.sent_images).any(|(i, s)| (i.id, i.col, i.row, i.w, i.h) != *s)
+    }
+
     fn dirty(&self) -> bool {
-        self.need_full || self.emu.term.is_dirty() || (self.copy.active && self.copy.dirty) || self.view() != self.sent_view
+        self.need_full || self.emu.term.is_dirty() || (self.copy.active && self.copy.dirty) || self.view() != self.sent_view || self.images_dirty()
     }
 
     fn view(&self) -> View {
@@ -324,6 +337,8 @@ impl Keeper {
                             self.conn = Some(c);
                             self.hello = false;
                             self.credit = false;
+                            self.sent_images.clear();
+                            self.sent_image_ids.clear();
                             self.linger_until = None;
                         }
                         Err(e) => logf!("accept setup failed: {}", e),
@@ -535,6 +550,8 @@ impl Keeper {
                 self.hello = true;
                 self.credit = true;
                 self.need_full = true;
+                self.sent_images.clear();
+                self.sent_image_ids.clear();
                 self.send_info();
                 self.proc_last = None;
                 self.check_proc();
@@ -848,6 +865,10 @@ impl Keeper {
         match frame {
             Ok(f) => {
                 self.send(k2s::FRAME, &f);
+                if self.images_dirty() {
+                    let msg = self.build_images();
+                    self.send(k2s::IMAGES, &msg);
+                }
                 self.sent_view = self.view();
                 self.credit = false;
                 self.last_frame = now;
@@ -855,6 +876,22 @@ impl Keeper {
             }
             Err(_) => self.recover(&[]),
         }
+    }
+
+    fn build_images(&mut self) -> Vec<u8> {
+        let imgs: Vec<crate::term::Image> = self.current_images().to_vec();
+        let mut e = Enc::new();
+        e.var(imgs.len() as u64);
+        for img in &imgs {
+            let send_data = self.sent_image_ids.insert(img.id);
+            e.u64(img.id).u16(img.col).u16(img.row).u16(img.w).u16(img.h).u8(img.preserve_aspect as u8).u8(send_data as u8);
+            if send_data {
+                e.str(&img.b64);
+            }
+        }
+        self.sent_image_ids.retain(|id| imgs.iter().any(|i| i.id == *id));
+        self.sent_images = imgs.iter().map(|i| (i.id, i.col, i.row, i.w, i.h)).collect();
+        e.buf
     }
 
     fn build_frame(&mut self) -> Vec<u8> {

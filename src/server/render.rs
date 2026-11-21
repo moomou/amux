@@ -3,11 +3,28 @@
 
 use super::exec::Fv;
 use super::plugins::{self, Tone};
-use super::{Client, Overlay, Server};
+use super::{Client, Overlay, Server, ShownImage};
 use crate::agents::State as AState;
 use crate::cell::*;
 use crate::format;
 use crate::model::Rect;
+
+pub struct CanvasImage {
+    pub pane: u32,
+    pub id: u64,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub preserve_aspect: bool,
+    pub b64: std::sync::Arc<str>,
+}
+
+impl CanvasImage {
+    fn shown(&self) -> ShownImage {
+        ShownImage { pane: self.pane, id: self.id, x: self.x, y: self.y, w: self.w, h: self.h }
+    }
+}
 
 pub struct Canvas {
     pub w: usize,
@@ -18,6 +35,7 @@ pub struct Canvas {
     pub shape: u8,
     pub mouse: bool,
     pub title: Option<String>,
+    pub images: Vec<CanvasImage>,
     status_new: Option<StatusCache>,
 }
 
@@ -39,7 +57,7 @@ impl Canvas {
     fn with_buffer(mut cells: Vec<Cell>, w: usize, h: usize) -> Canvas {
         cells.clear();
         cells.resize(w * h, Cell::EMPTY);
-        Canvas { w, h, cells, clusters: Clusters::default(), cursor: None, shape: 0, mouse: false, title: None, status_new: None }
+        Canvas { w, h, cells, clusters: Clusters::default(), cursor: None, shape: 0, mouse: false, title: None, images: Vec::new(), status_new: None }
     }
 
     #[inline]
@@ -295,6 +313,35 @@ fn draw_window(srv: &Server, c: &Client, cv: &mut Canvas, wid: u32, area: Rect) 
     let mouse_wanted = srv.panes.get(&win.active).map(|p| p.mirror.modes.mouse != 0).unwrap_or(false);
     cv.mouse |= mouse_wanted;
     blit_panes(srv, cv, wid, Rect { x: area.x, y: area.y, w: aw as u16, h: ah as u16 }, &rects, win.active, false);
+    if c.overlay.is_none() {
+        for (pid, r) in &rects {
+            let Some(p) = srv.panes.get(pid).filter(|p| !p.in_copy) else { continue };
+            if r.x as usize >= aw || r.y as usize >= ah {
+                continue;
+            }
+            let vw = r.w.min((aw - r.x as usize) as u16);
+            let vh = r.h.min((ah - r.y as usize) as u16);
+            for img in &p.mirror.images {
+                if img.col >= vw || img.row >= vh {
+                    continue;
+                }
+                let iw = img.w.min(vw - img.col);
+                let ih = img.h.min(vh - img.row);
+                if iw > 0 && ih > 0 {
+                    cv.images.push(CanvasImage {
+                        pane: *pid,
+                        id: img.id,
+                        x: area.x + r.x + img.col,
+                        y: area.y + r.y + img.row,
+                        w: iw,
+                        h: ih,
+                        preserve_aspect: img.preserve_aspect,
+                        b64: img.b64.clone(),
+                    });
+                }
+            }
+        }
+    }
     let ar = rects.iter().find(|(p, _)| *p == win.active).map(|(_, r)| *r);
     // display-panes overlay
     if let Some(Overlay::Panes { .. }) = &c.overlay {
@@ -1048,8 +1095,19 @@ fn emit(c: &mut Client, cv: Canvas) -> Vec<u8> {
         c.title = t.clone();
     }
     let full = c.full_redraw || c.front_size != (w as u16, h as u16) || c.front.len() != w * h;
+    let old_imgs = std::mem::take(&mut c.shown_images);
     if full {
         out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+    } else {
+        for old in &old_imgs {
+            if !cv.images.iter().any(|n| n.shown() == *old) {
+                for yy in (old.y as usize)..((old.y + old.h) as usize).min(h) {
+                    for xx in (old.x as usize)..((old.x + old.w) as usize).min(w) {
+                        c.front[yy * w + xx].ch = u32::MAX;
+                    }
+                }
+            }
+        }
     }
     let mut cur: Option<(usize, usize)> = None;
     let mut style: Option<Style> = if full { Some(Style::DEFAULT) } else { None };
@@ -1099,6 +1157,24 @@ fn emit(c: &mut Client, cv: Canvas) -> Vec<u8> {
             x += step;
         }
     }
+    for img in &cv.images {
+        let s = img.shown();
+        if full || !old_imgs.contains(&s) {
+            out.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio={};doNotMoveCursor=1:",
+                    img.y + 1,
+                    img.x + 1,
+                    img.w,
+                    img.h,
+                    img.preserve_aspect as u8
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(img.b64.as_bytes());
+            out.push(0x07);
+        }
+    }
     match cv.cursor {
         Some((x, y)) => {
             out.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
@@ -1111,6 +1187,7 @@ fn emit(c: &mut Client, cv: Canvas) -> Vec<u8> {
         None => c.cursor.2 = false,
     }
     out.extend_from_slice(b"\x1b[?2026l");
+    c.shown_images = cv.images.iter().map(|i| i.shown()).collect();
     c.spare = std::mem::replace(&mut c.front, cv.cells);
     c.clusters = cv.clusters;
     c.front_size = (w as u16, h as u16);

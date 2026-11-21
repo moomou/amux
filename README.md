@@ -15,10 +15,12 @@ amux a [NAME]        # reattach (or switch if already inside amux)
 ```
 
 Inside amux: `prefix A` opens the **agent dashboard**, `prefix N` jumps to the
-next agent that needs you and `prefix P` opens the **plugin view**. Everything
-else is tmux. To add a feature, ask an agent to build it as a plugin; it goes
-live the moment the file is saved (section 5). Already working in tmux?
-`amux migrate` moves your running sessions over without changing tmux
+next agent that needs you and `prefix P` opens the **plugin view**. Inline
+images (`imgcat` / iTerm2 `OSC 1337`, raw or `DCS tmux;`-wrapped) work out of
+the box inside panes and splits and survive detaching and reattaching.
+Everything else is tmux. To add a feature, ask an agent to build it as a
+plugin; it goes live the moment the file is saved (section 5). Already working
+in tmux? `amux migrate` moves your running sessions over without changing tmux
 (section 6).
 
 ---

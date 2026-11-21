@@ -1243,3 +1243,110 @@ fn status_bar_colors_propagate_across_all_segments() {
         status_ansi()
     );
 }
+
+#[test]
+fn imgcat_renders_inline_images_in_panes_splits_and_reattach() {
+    use std::os::fd::AsRawFd;
+    use std::sync::{Arc, Mutex};
+
+    let e = Env::new("imgcat", None);
+    // Build a valid minimal PNG with a 180x90 IHDR header and an imgcat-compatible script.
+    let png = e.dir.join("sample.png");
+    let mut raw_png = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+    raw_png.extend_from_slice(&180u32.to_be_bytes());
+    raw_png.extend_from_slice(&90u32.to_be_bytes());
+    raw_png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    raw_png.extend_from_slice(&[0u8; 256]);
+    std::fs::write(&png, &raw_png).unwrap();
+    let b64 = amux::util::base64_encode(&raw_png);
+
+    let fake_imgcat = e.dir.join("imgcat.sh");
+    std::fs::write(
+        &fake_imgcat,
+        r#"#!/bin/sh
+b64=$(base64 -w0 "$1")
+size=$(wc -c < "$1" | tr -d ' ')
+case "$TERM" in
+  screen*|tmux*) osc='\033Ptmux;\033\033]'; st='\007\033\\' ;;
+  *)             osc='\033]';              st='\007' ;;
+esac
+printf "${osc}1337;MultipartFile=inline=1;size=%s${st}" "$size"
+for part in $(printf "%s\n" "$b64" | fold -w 200); do
+  printf "${osc}1337;FilePart=%s${st}" "$part"
+done
+printf "${osc}1337;FileEnd${st}\n"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_imgcat, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    e.ok(&["new", "-d", "-s", "img"]);
+
+    // Helper: attach a real 100x30 PTY client and collect its raw output stream.
+    let spawn_pty_attach = |e: &Env| -> (Arc<Mutex<Vec<u8>>>, u32) {
+        let (master, slave) = amux::pty::open(100, 30).unwrap();
+        let argv = vec![bin().to_string(), "-L".into(), e.name.clone(), "-f".into(), e.config.clone(), "attach".into(), "-t".into(), "img".into()];
+        let env = vec![
+            ("AMUX_RUNTIME_DIR".into(), e.dir.join("run").to_string_lossy().into_owned()),
+            ("AMUX_STATE_DIR".into(), e.dir.join("state").to_string_lossy().into_owned()),
+            ("AMUX_PLUGIN_DIR".into(), e.dir.join("plugins").to_string_lossy().into_owned()),
+            ("TERM".into(), "xterm-256color".into()),
+            ("HOME".into(), amux::util::home()),
+        ];
+        let cpid = amux::pty::spawn(&slave, &amux::pty::SpawnSpec { argv: &argv, arg0: None, cwd: "/", env: &env }).unwrap();
+        drop(slave);
+        let _ = amux::util::set_nonblocking(master.as_raw_fd(), true);
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let out2 = out.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                let mut pfd = [amux::util::pfd(master.as_raw_fd(), amux::util::POLLIN)];
+                let _ = amux::util::poll(&mut pfd, Some(Duration::from_millis(50)));
+                match rustix::io::read(&master, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out2.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        (out, cpid)
+    };
+
+    let (out, cpid) = spawn_pty_attach(&e);
+    assert!(e.until(5.0, || !e.ok(&["list-clients"]).trim().is_empty()));
+
+    // 1. Default `tmux-256color` inside pane (`DCS tmux;` multipart) emits positioned 20x5 OSC 1337 image,
+    //    and subsequent text lands below row 5 instead of overwriting row 0..4.
+    e.ok(&["send-keys", "-t", "img", &format!("{} {} && echo AFTER-IMG-1", fake_imgcat.display(), png.display()), "Enter"]);
+    let want_20x5 = format!("1337;File=inline=1;width=20;height=5;preserveAspectRatio=1;doNotMoveCursor=1:{}\x07", b64);
+    assert!(
+        e.until(5.0, || String::from_utf8_lossy(&out.lock().unwrap()).contains(&want_20x5)),
+        "missing 20x5 OSC 1337 output; capture={:?}; out={:?}",
+        e.capture("img"),
+        String::from_utf8_lossy(&out.lock().unwrap())
+    );
+    assert!(e.until(5.0, || e.capture("img").contains("AFTER-IMG-1")));
+    let cy: usize = e.display("img", "#{cursor_y}").parse().unwrap();
+    assert!(cy >= 6, "prompt did not advance below 5-row image: cy={cy}");
+
+    // 2. Raw OSC 1337 (`TERM=xterm-256color`, as with `set -g default-terminal xterm-256color`) works identically.
+    out.lock().unwrap().clear();
+    e.ok(&["send-keys", "-t", "img", &format!("TERM=xterm-256color {} {}", fake_imgcat.display(), png.display()), "Enter"]);
+    assert!(e.until(5.0, || String::from_utf8_lossy(&out.lock().unwrap()).contains(&want_20x5)), "missing raw TERM=xterm-256color OSC 1337 output");
+
+    // 3. Splitting the pane narrows the left pane to 12 cols and clamps the re-emitted image width to 12.
+    out.lock().unwrap().clear();
+    e.ok(&["split-window", "-h", "-t", "img", "-l", "87"]);
+    let want_clamped = format!("1337;File=inline=1;width=12;height=5;preserveAspectRatio=1;doNotMoveCursor=1:{}\x07", b64);
+    assert!(e.until(5.0, || String::from_utf8_lossy(&out.lock().unwrap()).contains(&want_clamped)), "split resize did not re-emit clamped image");
+
+    // 4. Detach and reattach on a fresh client: visible inline images are repainted automatically.
+    e.ok(&["detach-client"]);
+    let _ = unsafe { libc::waitpid(cpid as i32, std::ptr::null_mut(), 0) };
+    let (out_reattach, cpid2) = spawn_pty_attach(&e);
+    assert!(e.until(5.0, || String::from_utf8_lossy(&out_reattach.lock().unwrap()).contains(&want_clamped)), "reattach did not repaint visible inline image");
+    e.ok(&["detach-client"]);
+    let _ = unsafe { libc::waitpid(cpid2 as i32, std::ptr::null_mut(), 0) };
+}

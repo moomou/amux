@@ -324,6 +324,7 @@ pub mod k2s {
     pub const COPIED: u8 = 69;
     pub const PROC: u8 = 70;
     pub const MODE: u8 = 71;
+    pub const IMAGES: u8 = 72;
 }
 
 /// Event kinds inside `k2s::EVENT`.

@@ -243,6 +243,26 @@ struct Dcs {
     buf: Vec<u8>,
 }
 
+const MAX_IMAGE_B64: usize = 24 << 20;
+const MAX_PANE_IMAGES: usize = 8;
+
+/// Visible inline image (OSC 1337 / `imgcat`) anchored to pane grid cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub id: u64,
+    pub col: u16,
+    pub row: u16,
+    pub w: u16,
+    pub h: u16,
+    pub preserve_aspect: bool,
+    pub b64: std::sync::Arc<str>,
+}
+
+struct MultipartImg {
+    args: String,
+    b64: Vec<u8>,
+}
+
 pub type Rgb = (u8, u8, u8);
 
 pub struct Term {
@@ -279,6 +299,10 @@ pub struct Term {
     pub out: Vec<u8>,
     pub events: Vec<Event>,
     dcs: Dcs,
+    pub images: Vec<Image>,
+    other_images: Vec<Image>,
+    next_image_id: u64,
+    img_part: Option<MultipartImg>,
     /// Default fg/bg colors of the outer terminal (for OSC 10/11 queries).
     pub default_colors: Option<(Rgb, Rgb)>,
     /// Number of rows scrolled into history (monotonic).
@@ -378,6 +402,10 @@ impl Term {
             out: Vec::new(),
             events: Vec::new(),
             dcs: Dcs::default(),
+            images: Vec::new(),
+            other_images: Vec::new(),
+            next_image_id: 1,
+            img_part: None,
             default_colors: None,
             scrolled: 0,
             hscrolled: 0,
@@ -520,6 +548,9 @@ impl Term {
         }
         let (x0, y, cols) = (self.cur.x, self.cur.y, self.cols);
         let n = bytes.len().min(cols - x0);
+        if !self.images.is_empty() {
+            self.evict_images_in(x0, y, x0 + n, y + 1);
+        }
         let pen = self.cur.pen;
         let size0 = self.run_size0;
         let r = &mut self.grid[y];
@@ -580,6 +611,9 @@ impl Term {
         let (x, y) = (self.cur.x, self.cur.y);
         if self.tx() > cols - w {
             return;
+        }
+        if !self.images.is_empty() {
+            self.evict_images_in(x, y, x + w, y + 1);
         }
         let pen = self.cur.pen;
         let cell = Cell { ch: c as u32, fg: pen.fg, bg: pen.bg };
@@ -783,6 +817,9 @@ impl Term {
         if x0 >= x1 {
             return;
         }
+        if !self.images.is_empty() {
+            self.evict_images_in(x0, y, x1, y + 1);
+        }
         let blank = self.erase_cell();
         if x0 == 0 && x1 == self.cols {
             self.clear_lines(y, 1);
@@ -800,6 +837,7 @@ impl Term {
 
     /// Clear the screen; on the primary screen used rows go to history (tmux semantics).
     fn clear_screen(&mut self) {
+        self.images.clear();
         if self.in_alt {
             self.clear_lines(0, self.rows);
             return;
@@ -835,6 +873,9 @@ impl Term {
         if n == 0 || y >= self.rows {
             return;
         }
+        if !self.images.is_empty() {
+            self.evict_images_in(0, y, self.cols, (y + n).min(self.rows));
+        }
         let blank = self.erase_cell();
         let cols = self.cols;
         for yy in y..(y + n).min(self.rows) {
@@ -857,6 +898,11 @@ impl Term {
     fn move_lines(&mut self, dy: usize, py: usize, ny: usize) {
         if ny == 0 || py == dy || py + ny > self.rows || dy + ny > self.rows {
             return;
+        }
+        if !self.images.is_empty() {
+            let y0 = py.min(dy);
+            let y1 = (py.max(dy) + ny).min(self.rows);
+            self.evict_images_in(0, y0, self.cols, y1);
         }
         self.unwrap_above(dy);
         if dy > py {
@@ -926,6 +972,18 @@ impl Term {
         self.scrolled += n as u64;
         if top == 0 && bot == self.rows - 1 {
             self.hscrolled += n;
+            if !self.images.is_empty() {
+                self.images.retain_mut(|img| {
+                    if (img.row as usize) >= n {
+                        img.row -= n as u16;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        } else if !self.images.is_empty() {
+            self.evict_images_in(0, top, self.cols, bot + 1);
         }
         let cols = self.cols;
         self.grid[top..=bot].rotate_left(n);
@@ -1093,6 +1151,7 @@ impl Term {
         let cols = self.cols;
         let alt: Vec<Row> = (0..self.rows).map(|_| Row::new(cols, Cell::EMPTY)).collect();
         self.other = Some(std::mem::replace(&mut self.grid, alt));
+        self.other_images = std::mem::take(&mut self.images);
         self.in_alt = true;
         self.modes.alt_screen = true;
         self.hist.close();
@@ -1126,6 +1185,9 @@ impl Term {
                 self.grid = p;
             }
         }
+        self.images = std::mem::take(&mut self.other_images);
+        let (cols, rows) = (self.cols, self.rows);
+        self.images.retain(|img| (img.col as usize) < cols && (img.row as usize + img.h as usize) <= rows);
         self.in_alt = false;
         self.modes.alt_screen = false;
         self.mark_all();
@@ -1172,6 +1234,7 @@ impl Term {
         }
         self.end_run();
         let old_cols = self.cols;
+        let old_cy = self.cur.y;
         if self.in_alt {
             // tmux resizes the saved primary screen only when leaving the
             // alternate screen; here only the alternate grid changes.
@@ -1189,6 +1252,19 @@ impl Term {
             self.cur.x = nx;
             self.cur.y = ny;
             self.cur.pending = np;
+        }
+        if !self.images.is_empty() {
+            let dy = self.cur.y as isize - old_cy as isize;
+            self.images.retain_mut(|img| {
+                let nr = img.row as isize + dy;
+                if nr < 0 || (img.col as usize) >= cols || (nr as usize) >= rows {
+                    return false;
+                }
+                img.row = nr as u16;
+                img.w = img.w.min((cols - img.col as usize) as u16).max(1);
+                img.h = img.h.min((rows - nr as usize) as u16).max(1);
+                true
+            });
         }
         self.cols = cols;
         self.rows = rows;
@@ -2142,6 +2218,7 @@ impl vte::Perform for Term {
                 let t = params.get(2).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default();
                 self.events.push(Event::Notify(t, join(3)));
             }
+            b"1337" => self.osc_1337(&params[1..]),
             _ => {}
         }
     }
@@ -2229,5 +2306,297 @@ impl Emulator {
     }
     pub fn feed(&mut self, b: &[u8]) {
         self.term.feed(&mut self.parser, b);
+    }
+}
+
+impl Term {
+    fn evict_images_in(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        self.images.retain(|img| {
+            let (ix0, iy0) = (img.col as usize, img.row as usize);
+            let (ix1, iy1) = (ix0 + img.w as usize, iy0 + img.h as usize);
+            ix1 <= x0 || ix0 >= x1 || iy1 <= y0 || iy0 >= y1
+        });
+    }
+
+    fn osc_1337(&mut self, parts: &[&[u8]]) {
+        let Some(&first) = parts.first() else { return };
+        if first == b"FileEnd" {
+            if let Some(m) = self.img_part.take() {
+                self.place_image(&m.args, &m.b64);
+            }
+            return;
+        }
+        if let Some(chunk) = first.strip_prefix(b"FilePart=") {
+            if let Some(m) = self.img_part.as_mut() {
+                let clean: Vec<u8> = chunk.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+                if m.b64.len() + clean.len() <= MAX_IMAGE_B64 {
+                    m.b64.extend_from_slice(&clean);
+                } else {
+                    self.img_part = None;
+                }
+            }
+            return;
+        }
+        // Join `k=v;k=v...` (and `:base64` for single-shot `File=`).
+        let total: usize = parts.iter().map(|p| p.len() + 1).sum();
+        if total > MAX_IMAGE_B64 + 4096 {
+            return;
+        }
+        let mut raw = Vec::with_capacity(total);
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                raw.push(b';');
+            }
+            raw.extend_from_slice(p);
+        }
+        if let Some(rest) = raw.strip_prefix(b"MultipartFile=") {
+            let args = String::from_utf8_lossy(rest).into_owned();
+            self.img_part = Some(MultipartImg { args, b64: Vec::new() });
+        } else if let Some(rest) = raw.strip_prefix(b"File=")
+            && let Some(colon) = rest.iter().position(|&b| b == b':')
+        {
+            let args = String::from_utf8_lossy(&rest[..colon]).into_owned();
+            self.place_image(&args, &rest[colon + 1..]);
+        }
+    }
+
+    fn place_image(&mut self, args: &str, raw_b64: &[u8]) {
+        let b64_bytes: Vec<u8> = raw_b64.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+        if b64_bytes.is_empty() || b64_bytes.len() > MAX_IMAGE_B64 {
+            return;
+        }
+        let Ok(b64_str) = String::from_utf8(b64_bytes) else { return };
+        if self.cur.pending {
+            self.cr();
+            self.linefeed();
+        }
+        let cx = self.cur.x;
+        let max_w = self.cols.saturating_sub(cx).max(1);
+        let max_h = self.rows.saturating_sub(1).max(1);
+        let px = image_dimensions(&b64_str);
+        let Some((w, h, preserve_aspect)) = compute_image_cells(args, px, max_w, max_h) else { return };
+        for _ in 1..h {
+            self.linefeed();
+        }
+        let top_row = self.cur.y + 1 - h;
+        self.evict_images_in(cx, top_row, cx + w, top_row + h);
+        for yy in top_row..top_row + h {
+            for c in &mut self.grid[yy].cells[cx..(cx + w).min(self.cols)] {
+                *c = Cell::EMPTY;
+            }
+        }
+        let b64: std::sync::Arc<str> = b64_str.into();
+        while self.images.len() >= MAX_PANE_IMAGES
+            || (!self.images.is_empty() && self.images.iter().map(|i| i.b64.len()).sum::<usize>() + b64.len() > MAX_IMAGE_B64)
+        {
+            self.images.remove(0);
+        }
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.images.push(Image { id, col: cx as u16, row: top_row as u16, w: w as u16, h: h as u16, preserve_aspect, b64 });
+        self.cur.x = 0;
+        self.cur.pending = false;
+        self.mark_range(top_row, top_row + h - 1);
+    }
+}
+
+fn parse_img_dim(spec: &str, avail_cells: usize, cell_px: u32) -> Option<usize> {
+    let s = spec.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    if let Some(px) = s.strip_suffix("px") {
+        let n: u32 = px.parse().ok()?;
+        return Some(n.max(1).div_ceil(cell_px) as usize);
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let p: usize = pct.parse().ok()?;
+        return Some((avail_cells * p.min(100)).div_ceil(100).max(1));
+    }
+    s.parse::<usize>().ok().map(|n| n.max(1))
+}
+
+/// Compute `(w_cells, h_cells, preserve_aspect)` for an OSC 1337 image; `None` if not `inline=1`.
+pub fn compute_image_cells(args: &str, px: Option<(u32, u32)>, max_w: usize, max_h: usize) -> Option<(usize, usize, bool)> {
+    let mut inline = false;
+    let mut w_spec = "";
+    let mut h_spec = "";
+    let mut preserve = true;
+    for kv in args.split(';') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k.trim() {
+            "inline" => inline = v.trim() == "1",
+            "width" => w_spec = v.trim(),
+            "height" => h_spec = v.trim(),
+            "preserveAspectRatio" => preserve = v.trim() != "0",
+            _ => {}
+        }
+    }
+    if !inline {
+        return None;
+    }
+    let (px_w, px_h) = px.filter(|&(w, h)| w > 0 && h > 0).unwrap_or((360, 216));
+    let req_w = parse_img_dim(w_spec, max_w, 9);
+    let req_h = parse_img_dim(h_spec, max_h, 18);
+    let fit = |bw: usize, bh: usize| -> (usize, usize) {
+        let (bw, bh) = (bw.max(1), bh.max(1));
+        let num_w = bw as u64 * px_h as u64;
+        let num_h = bh as u64 * px_w as u64 * 2;
+        if num_w <= num_h {
+            let h = ((bw as u64 * px_h as u64).div_ceil((px_w as u64 * 2).max(1)) as usize).clamp(1, bh);
+            (bw, h)
+        } else {
+            let w = ((bh as u64 * px_w as u64 * 2).div_ceil(px_h as u64) as usize).clamp(1, bw);
+            (w, bh)
+        }
+    };
+    let (w, h) = match (req_w, req_h) {
+        (Some(w), Some(h)) => {
+            let (w, h) = (w.min(max_w), h.min(max_h));
+            if preserve { fit(w, h) } else { (w, h) }
+        }
+        (Some(w), None) => {
+            let w = w.min(max_w);
+            let h = (w as u64 * px_h as u64).div_ceil((px_w as u64 * 2).max(1)) as usize;
+            if h > max_h && preserve { fit(w, max_h) } else { (w, h.clamp(1, max_h)) }
+        }
+        (None, Some(h)) => {
+            let h = h.min(max_h);
+            let w = (h as u64 * px_w as u64 * 2).div_ceil(px_h as u64) as usize;
+            if w > max_w && preserve { fit(max_w, h) } else { (w.clamp(1, max_w), h) }
+        }
+        (None, None) => {
+            let nat_w = px_w.div_ceil(9) as usize;
+            let nat_h = px_h.div_ceil(18) as usize;
+            if nat_w <= max_w && nat_h <= max_h { (nat_w.max(1), nat_h.max(1)) } else { fit(nat_w.min(max_w), nat_h.min(max_h)) }
+        }
+    };
+    Some((w.max(1), h.max(1), preserve))
+}
+
+/// Extract `(width_px, height_px)` from the header of a base64-encoded PNG, JPEG, GIF, WebP, or BMP.
+pub fn image_dimensions(b64: &str) -> Option<(u32, u32)> {
+    let head_len = (b64.len().min(128)) & !3;
+    if head_len < 16 {
+        return None;
+    }
+    let b = crate::util::base64_decode(&b64[..head_len])?;
+    if b.len() >= 24 && &b[..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes(b[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(b[20..24].try_into().ok()?);
+        return Some((w, h));
+    }
+    if b.len() >= 10 && (&b[..6] == b"GIF87a" || &b[..6] == b"GIF89a") {
+        let w = u16::from_le_bytes(b[6..8].try_into().ok()?) as u32;
+        let h = u16::from_le_bytes(b[8..10].try_into().ok()?) as u32;
+        return Some((w, h));
+    }
+    if b.len() >= 26 && &b[..2] == b"BM" {
+        let w = i32::from_le_bytes(b[18..22].try_into().ok()?).unsigned_abs();
+        let h = i32::from_le_bytes(b[22..26].try_into().ok()?).unsigned_abs();
+        return Some((w, h));
+    }
+    if b.len() >= 30 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        return match &b[12..16] {
+            b"VP8 " => {
+                let w = (u16::from_le_bytes(b[26..28].try_into().ok()?) & 0x3fff) as u32;
+                let h = (u16::from_le_bytes(b[28..30].try_into().ok()?) & 0x3fff) as u32;
+                Some((w, h))
+            }
+            b"VP8L" => {
+                let bits = u32::from_le_bytes(b[21..25].try_into().ok()?);
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            b"VP8X" => {
+                let w = (b[24] as u32 | ((b[25] as u32) << 8) | ((b[26] as u32) << 16)) + 1;
+                let h = (b[27] as u32 | ((b[28] as u32) << 8) | ((b[29] as u32) << 16)) + 1;
+                Some((w, h))
+            }
+            _ => None,
+        };
+    }
+    if b.len() >= 4 && b[0] == 0xff && b[1] == 0xd8 {
+        let jlen = (b64.len().min(43_692)) & !3;
+        let jb = crate::util::base64_decode(&b64[..jlen])?;
+        let mut i = 2;
+        while i + 8 < jb.len() {
+            if jb[i] != 0xff {
+                i += 1;
+                continue;
+            }
+            while i < jb.len() && jb[i] == 0xff {
+                i += 1;
+            }
+            if i + 7 >= jb.len() {
+                break;
+            }
+            let m = jb[i];
+            i += 1;
+            if m == 0xd9 || m == 0xda {
+                break;
+            }
+            if (0xd0..=0xd8).contains(&m) || m == 0x01 {
+                continue;
+            }
+            let seglen = u16::from_be_bytes([jb[i], jb[i + 1]]) as usize;
+            if (0xc0..=0xcf).contains(&m) && !matches!(m, 0xc4 | 0xc8 | 0xcc) && i + 7 <= jb.len() {
+                let h = u16::from_be_bytes([jb[i + 3], jb[i + 4]]) as u32;
+                let w = u16::from_be_bytes([jb[i + 5], jb[i + 6]]) as u32;
+                return Some((w, h));
+            }
+            if seglen < 2 {
+                break;
+            }
+            i += seglen;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_png_b64(w: u32, h: u32) -> String {
+        let mut v = Vec::from(&b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..]);
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        crate::util::base64_encode(&v)
+    }
+
+    #[test]
+    fn parses_image_dimensions_and_places_both_raw_and_dcs_tmux_imgcat() {
+        let b64 = fake_png_b64(180, 90);
+        assert_eq!(image_dimensions(&b64), Some((180, 90)));
+
+        // 1. Raw OSC 1337 File= places a 20x5 cell image and leaves prompt on row 5 after `\n`.
+        let mut emu = Emulator::new(80, 24, 100);
+        emu.feed(format!("\x1b]1337;File=inline=1:{}\x07\n$ ", b64).as_bytes());
+        assert_eq!(emu.term.images.len(), 1);
+        assert_eq!((emu.term.images[0].col, emu.term.images[0].row, emu.term.images[0].w, emu.term.images[0].h), (0, 0, 20, 5));
+        assert_eq!(emu.term.cursor(), (2, 5));
+
+        // 2. DCS tmux;-wrapped MultipartFile + FilePart + FileEnd (exact `~/.iterm2/imgcat` output).
+        let (p1, p2) = b64.split_at(b64.len() / 2);
+        let seq = format!(
+            "\x1bPtmux;\x1b\x1b]1337;MultipartFile=inline=1;width=30\x07\x1b\\\
+             \x1bPtmux;\x1b\x1b]1337;FilePart={}\x07\x1b\\\
+             \x1bPtmux;\x1b\x1b]1337;FilePart={}\x07\x1b\\\
+             \x1bPtmux;\x1b\x1b]1337;FileEnd\x07\x1b\\\r\n",
+            p1, p2
+        );
+        emu.feed(seq.as_bytes());
+        assert_eq!(emu.term.images.len(), 2);
+        assert_eq!((emu.term.images[1].col, emu.term.images[1].row, emu.term.images[1].w, emu.term.images[1].h), (2, 5, 30, 8));
+        assert_eq!(emu.term.cursor(), (0, 13));
+
+        // 3. Alt-screen (e.g. vim) stashes primary images and restores them on exit; `clear` removes them.
+        emu.feed(b"\x1b[?1049h");
+        assert!(emu.term.images.is_empty());
+        emu.feed(b"\x1b[?1049l");
+        assert_eq!(emu.term.images.len(), 2);
+        emu.feed(b"\x1b[2J");
+        assert!(emu.term.images.is_empty());
     }
 }

@@ -30,6 +30,29 @@ use std::time::{Duration, Instant};
 
 pub const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(8);
 
+/// Visible inline image inside a pane's mirror.
+#[derive(Clone)]
+pub struct PaneImage {
+    pub id: u64,
+    pub col: u16,
+    pub row: u16,
+    pub w: u16,
+    pub h: u16,
+    pub preserve_aspect: bool,
+    pub b64: std::sync::Arc<str>,
+}
+
+/// Image placement last emitted to an attached client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ShownImage {
+    pub pane: u32,
+    pub id: u64,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
 /// Server-side mirror of a pane's visible screen. Rows are stored sparsely
 /// (trailing empty cells trimmed), so mostly-empty panes cost little.
 #[derive(Default)]
@@ -44,6 +67,8 @@ pub struct Mirror {
     pub cursor_visible: bool,
     pub modes: Modes,
     pub title: String,
+    pub images: Vec<PaneImage>,
+    pub image_blobs: HashMap<u64, std::sync::Arc<str>>,
 }
 
 impl Mirror {
@@ -231,6 +256,7 @@ pub struct Client {
     pub overlay: Option<Overlay>,
     pub front: Vec<Cell>,
     pub front_size: (u16, u16),
+    pub shown_images: Vec<ShownImage>,
     pub status_cache: Option<render::StatusCache>,
     /// The previous frame's canvas allocation, reused by the next render.
     pub spare: Vec<Cell>,
@@ -1703,6 +1729,38 @@ impl Server {
                     self.redraw_window(w);
                 }
             }
+            k2s::IMAGES => {
+                let n = d.len()?.min(16);
+                let mut imgs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let img_id = d.u64()?;
+                    let col = d.u16()?;
+                    let row = d.u16()?;
+                    let w = d.u16()?;
+                    let h = d.u16()?;
+                    let preserve_aspect = d.u8()? != 0;
+                    let has_data = d.u8()? != 0;
+                    let b64 = if has_data {
+                        let s: std::sync::Arc<str> = d.str()?.into();
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.mirror.image_blobs.insert(img_id, s.clone());
+                        }
+                        Some(s)
+                    } else {
+                        self.panes.get(&id).and_then(|p| p.mirror.image_blobs.get(&img_id).cloned())
+                    };
+                    if let Some(b64) = b64 {
+                        imgs.push(PaneImage { id: img_id, col, row, w, h, preserve_aspect, b64 });
+                    }
+                }
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.mirror.image_blobs.retain(|k, _| imgs.iter().any(|i| i.id == *k));
+                    p.mirror.images = imgs;
+                }
+                if let Some(w) = self.window_of_pane(id) {
+                    self.redraw_window(w);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2101,6 +2159,7 @@ impl Client {
             overlay: None,
             front: Vec::new(),
             front_size: (0, 0),
+            shown_images: Vec::new(),
             status_cache: None,
             spare: Vec::new(),
             clusters: Clusters::default(),
